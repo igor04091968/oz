@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$ExePath = Join-Path $InstallDir "pfsense-mssql-orchestrator.exe"
+$ExePath = Join-Path $InstallDir "oz.exe"
 
 if (-not (Get-Command nssm.exe -ErrorAction SilentlyContinue)) {
     throw "nssm.exe not found in PATH"

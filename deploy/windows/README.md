@@ -6,7 +6,7 @@ optional and should only be enabled after the manual workflow is validated.
 ## Layout
 
 ```text
-C:\Tools\PfsenseMssqlOrchestrator\pfsense-mssql-orchestrator.exe
+C:\Tools\OZ\oz.exe
 C:\Tools\PfsenseMssqlOrchestrator\config.toml
 C:\Tools\PfsenseMssqlOrchestrator\workstations.toml
 C:\Tools\PfsenseMssqlOrchestrator\audit.sqlite3
@@ -37,6 +37,6 @@ after `--once --dry-run` and one controlled `--once --apply` have been validated
 For normal desktop use, run manually instead:
 
 ```powershell
-.\pfsense-mssql-orchestrator.exe process-requests --config .\config.toml --once --dry-run
-.\pfsense-mssql-orchestrator.exe process-requests --config .\config.toml --once --apply
+.\oz.exe process-requests --config .\config.toml --once --dry-run
+.\oz.exe process-requests --config .\config.toml --once --apply
 ```

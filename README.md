@@ -1,4 +1,4 @@
-# pfsense-mssql-orchestrator
+# ОЗ — отслеживание заявок
 
 Rust service for applying pfSense REST API changes from desired state stored in
 Microsoft SQL Server.
@@ -101,7 +101,7 @@ cargo build --release
 ```
 
 GitHub Actions builds and publishes a Windows artifact named
-`pfsense-mssql-orchestrator-windows-x86_64`.
+`oz-windows-x86_64`.
 
 ## Safety Notes
 

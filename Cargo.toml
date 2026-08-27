@@ -1,5 +1,5 @@
 [package]
-name = "pfsense-mssql-orchestrator"
+name = "oz"
 version = "0.1.0"
 edition = "2024"
 

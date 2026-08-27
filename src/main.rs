@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -167,7 +169,7 @@ async fn main() -> Result<()> {
     }
 }
 
-const GUI_SERVICE: &str = "pfsense-mssql-orchestrator";
+const GUI_SERVICE: &str = "oz";
 const MSSQL_SECRET: &str = "mssql-connection-string";
 const PFSENSE_SECRET: &str = "pfsense-api-token";
 
@@ -264,8 +266,7 @@ impl GuiApp {
         };
         thread::spawn(move || {
             let mut command = std::process::Command::new(
-                std::env::current_exe()
-                    .unwrap_or_else(|_| PathBuf::from("pfsense-mssql-orchestrator.exe")),
+                std::env::current_exe().unwrap_or_else(|_| PathBuf::from("oz.exe")),
             );
             command.args(["process-requests", "--config", &config_path, "--once"]);
             if apply {
@@ -303,7 +304,7 @@ impl eframe::App for GuiApp {
         }
         ctx.request_repaint_after(Duration::from_millis(250));
         eframe::egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("pfSense MSSQL Orchestrator");
+            ui.heading("ОЗ — отслеживание заявок");
             ui.label("Подключения, параметры обработки и журнал запуска");
             ui.separator();
             eframe::egui::CollapsingHeader::new("MSSQL")
@@ -465,7 +466,7 @@ body_template = "{{\"type\":\"pass\",\"interface\":\"openvpn\",\"ipprotocol\":\"
 fn run_gui() -> Result<()> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
-        "pfSense MSSQL Orchestrator",
+        "ОЗ — отслеживание заявок",
         options,
         Box::new(|_cc| Ok(Box::new(GuiApp::new()))),
     )
@@ -1078,10 +1079,7 @@ mod tests {
     #[test]
     fn gui_runtime_config_is_valid_toml_without_secrets() {
         let mut settings = GuiSettings::default();
-        let path = std::env::temp_dir().join(format!(
-            "pfsense-mssql-orchestrator-test-{}.toml",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("oz-test-{}.toml", std::process::id()));
         settings.config_path = path.to_string_lossy().into_owned();
         write_runtime_config(&settings).unwrap();
         let raw = fs::read_to_string(&path).unwrap();
