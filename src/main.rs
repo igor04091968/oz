@@ -182,7 +182,6 @@ struct GuiSettings {
     mapping_file: String,
     query_file: String,
     audit_db_path: String,
-    rdp_port: String,
 }
 
 impl Default for GuiSettings {
@@ -197,7 +196,6 @@ impl Default for GuiSettings {
             mapping_file: "workstations.toml".to_owned(),
             query_file: "sql/remote_work_requests.sql".to_owned(),
             audit_db_path: "audit.sqlite3".to_owned(),
-            rdp_port: "3389".to_owned(),
         }
     }
 }
@@ -338,7 +336,6 @@ impl eframe::App for GuiApp {
                         &mut self.settings.mapping_file,
                     );
                     text_field(ui, "Журнал SQLite", &mut self.settings.audit_db_path);
-                    text_field(ui, "Порт RDP", &mut self.settings.rdp_port);
                 });
             ui.separator();
             ui.checkbox(&mut self.apply, "Применять изменения в pfSense (APPLY)");
@@ -458,7 +455,7 @@ body_template = "{{\"type\":\"pass\",\"interface\":\"openvpn\",\"ipprotocol\":\"
         settings.query_file,
         settings.query_file,
         settings.mapping_file,
-        settings.rdp_port.parse::<u16>().unwrap_or(3389),
+        3389,
         settings.pfsense_url
     );
     fs::write(&settings.config_path, config)

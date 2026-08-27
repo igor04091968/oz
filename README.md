@@ -75,7 +75,9 @@ cargo run -- gui
 The GUI edits non-secret settings, stores the MSSQL password and pfSense API
 token in the operating system credential store, generates the runtime
 `config.toml`, and starts the same `process-requests` workflow. Dry-run is
-selected by default; enable APPLY only after reviewing the result.
+selected by default; enable APPLY only after reviewing the result. The
+application is intended to run directly on `WS-GST01`; it does not implement
+an RDP client. RDP is used only as the destination service in the pfSense rule.
 
 ```sh
 cargo run -- plan --config config.toml
