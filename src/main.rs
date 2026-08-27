@@ -1,5 +1,15 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+//! ОЗ — небольшой оркестратор заявок на удаленную работу.
+//!
+//! Программа имеет два сценария запуска:
+//! - CLI для планирования и применения операций pfSense;
+//! - GUI для настройки подключений, фонового опроса MSSQL и click-to-call.
+//!
+//! Секреты намеренно не записываются в TOML и не попадают в журнал. GUI хранит
+//! их в системном хранилище учетных данных, а CLI получает их через переменные
+//! окружения.
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +39,9 @@ struct Cli {
     command: Option<Command>,
 }
 
+// Подкоманды разделены по уровню автоматизации: plan только читает данные,
+// run работает с общим desired-state запросом, process-requests обслуживает
+// заявки на удаленную работу, gui запускает настольный интерфейс.
 #[derive(Subcommand)]
 enum Command {
     Plan(CommonArgs),
@@ -37,12 +50,16 @@ enum Command {
     Gui,
 }
 
+// Общий аргумент конфигурации. Переменная окружения удобна для запуска из
+// Планировщика заданий или внешнего служебного скрипта.
 #[derive(Args, Clone)]
 struct CommonArgs {
     #[arg(long, env = "ORCH_CONFIG", default_value = "config.toml")]
     config: String,
 }
 
+// --dry-run является безопасным режимом по умолчанию для ручной проверки.
+// Фактическое изменение pfSense разрешается только явным --apply.
 #[derive(Args, Clone)]
 struct RunArgs {
     #[command(flatten)]
@@ -58,6 +75,8 @@ struct RunArgs {
     apply: bool,
 }
 
+// Эти структуры описывают runtime-конфигурацию. Они не содержат паролей и
+// токенов: вместо них хранятся имена переменных окружения.
 #[derive(Debug, Deserialize)]
 struct AppConfig {
     runtime: RuntimeConfig,
@@ -104,6 +123,8 @@ struct PfsenseOperationTemplate {
     body_template: String,
 }
 
+// Нормализованная операция, которую можно повторно применить без дублей:
+// desired_hash используется аудитом как идемпотентный идентификатор состояния.
 #[derive(Debug, Clone)]
 struct DesiredOperation {
     rule_key: String,
@@ -140,6 +161,8 @@ struct RemoteWorkRequest {
     por_neisp: i32,
 }
 
+// Точка входа выбирает GUI, если аргументы не переданы. Это позволяет запускать
+// собранный oz.exe двойным щелчком с рабочего стола.
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -178,6 +201,8 @@ const MSSQL_SECRET: &str = "mssql-connection-string";
 const PFSENSE_SECRET: &str = "pfsense-api-token";
 const XMPP_SECRET: &str = "xmpp-account-password";
 
+// Настройки GUI сериализуются в gui-settings.toml. Поля с паролями отсутствуют:
+// реальные значения загружаются из Credential Manager только в память процесса.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct GuiSettings {
@@ -241,6 +266,9 @@ struct GuiApp {
 }
 
 impl GuiApp {
+    // При старте читаем обычные параметры и отдельно пытаемся восстановить
+    // секреты из системного хранилища. Отсутствующий секрет не блокирует GUI:
+    // пользователь сможет ввести его вручную.
     fn new() -> Self {
         let settings = load_gui_settings().unwrap_or_default();
         let mssql_password = read_secret(MSSQL_SECRET).unwrap_or_default();
@@ -299,6 +327,8 @@ impl GuiApp {
         } else {
             "Выполняется dry-run...".to_owned()
         };
+        // Фоновый поток не блокирует egui. Результаты каждой проверки возвращаются
+        // в GUI через канал, а stop-флаг позволяет корректно завершить поток.
         thread::spawn(move || {
             let mut notified_fingerprint = String::new();
             loop {
@@ -346,6 +376,8 @@ impl GuiApp {
         let recipient = self.settings.xmpp_call_recipient.clone();
         let tx = self.result_tx.clone();
         self.status = format!("Отправка команды звонка на {target}...");
+        // Сетевой XMPP-сеанс выполняется вне потока интерфейса, иначе задержка
+        // соединения или авторизации временно заморозит окно.
         thread::spawn(move || {
             let result =
                 send_xmpp_call_blocking(&server, &port, &account, &password, &recipient, &target);
@@ -375,6 +407,8 @@ fn run_gui_poll(
     apply: bool,
     notified_fingerprint: &mut String,
 ) -> String {
+    // GUI запускает тот же process-requests, что и CLI. Это исключает расхождение
+    // логики между ручным запуском и периодическим фоновым режимом.
     let mut command = std::process::Command::new(
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("oz.exe")),
     );
@@ -407,6 +441,8 @@ fn run_gui_poll(
         format!("Ошибка ({}).\n{}{}", output.status, stdout, stderr)
     };
 
+    // Уведомление отправляется только при изменении набора необработанных заявок.
+    // Поэтому один и тот же запрос не создает поток сообщений каждую минуту.
     if let Some((pending, fingerprint)) = result {
         if pending == 0 {
             notified_fingerprint.clear();
@@ -480,6 +516,8 @@ fn parse_poll_result(line: &str) -> Option<(usize, String)> {
     Some((pending?, fingerprint?))
 }
 
+// Блокирующая обертка нужна GUI-потоку: внутри создается короткоживущий Tokio
+// runtime, а egui остается синхронным и простым.
 fn send_xmpp_message_blocking(
     server: &str,
     port: &str,
@@ -500,6 +538,8 @@ fn send_xmpp_message_blocking(
         .map_err(|error| format!("{error:#}"))
 }
 
+// ATS ожидает обычное Miranda-сообщение "Позвонить <цель>" на JID pbx.
+// Номер-источник определяется на АТС по JID учетной записи OZ через sippeers.
 fn send_xmpp_call_blocking(
     server: &str,
     port: &str,
@@ -525,6 +565,8 @@ fn send_xmpp_call_blocking(
         .map_err(|error| format!("{error:#}"))
 }
 
+// Проверяем только техническую корректность цели. Разрешение номера, WS или
+// JID выполняется штатным parser-ом ATS, поэтому OZ не дублирует его правила.
 fn validate_call_target(target: &str) -> Result<()> {
     if target.is_empty() {
         bail!("цель звонка не указана")
@@ -543,6 +585,9 @@ async fn send_xmpp_message(
     recipient: &str,
     body: &str,
 ) -> Result<()> {
+    // Реализация соответствует текущему ATS-контру: TCP XMPP, SASL PLAIN,
+    // bind ресурса и одно chat-сообщение. TLS здесь не добавляем, поскольку
+    // существующая ATS-схема работает внутри доверенного контура без TLS.
     let (localpart, domain) = account
         .split_once('@')
         .context("XMPP account must be a full JID")?;
@@ -555,6 +600,8 @@ async fn send_xmpp_message(
     );
     stream.write_all(stream_open.as_bytes()).await?;
     read_xmpp_until(&mut stream, "<stream:features", "XMPP features").await?;
+    // SASL PLAIN содержит пароль только в памяти и в защищенном TCP-сеансе
+    // внутреннего контура; в логи это значение никогда не выводится.
     let auth =
         base64::engine::general_purpose::STANDARD.encode(format!("\0{localpart}\0{password}"));
     stream
@@ -586,6 +633,8 @@ async fn send_xmpp_message(
 }
 
 async fn read_xmpp_until(stream: &mut TcpStream, marker: &str, context: &str) -> Result<()> {
+    // Ограничение буфера защищает фоновый поток от бесконечного роста при
+    // поврежденном или неожиданно большом ответе XMPP-сервера.
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 2048];
     loop {
@@ -615,6 +664,8 @@ fn xml_escape(value: &str) -> String {
 }
 
 impl eframe::App for GuiApp {
+    // egui вызывает update часто. Здесь только читаем сообщения из канала,
+    // обновляем статус и рисуем форму; тяжелые операции выполняются в потоках.
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         if let Ok(message) = self.result_rx.try_recv() {
             if !self.settings.poll_enabled {
@@ -795,6 +846,8 @@ fn build_connection_string(settings: &GuiSettings, password: &str) -> String {
     )
 }
 
+// Генерируем минимальный runtime config для дочернего process-requests.
+// Пароль MSSQL и токен pfSense передаются ему только через environment.
 fn write_runtime_config(settings: &GuiSettings) -> Result<()> {
     let interval_seconds = settings
         .poll_interval_seconds
@@ -844,6 +897,8 @@ body_template = "{{\"type\":\"pass\",\"interface\":\"openvpn\",\"ipprotocol\":\"
 }
 
 fn run_gui() -> Result<()> {
+    // У Windows включен windows_subsystem = "windows", поэтому запуск GUI не
+    // открывает дополнительное консольное окно.
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "ОЗ — отслеживание заявок",
@@ -885,6 +940,9 @@ fn print_plan(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+// Обработка заявок идет в строгом порядке: получить данные, отфильтровать уже
+// обработанные, проверить согласование, найти рабочую станцию и только затем
+// при --apply изменить pfSense. В dry-run выполняется тот же расчет без записи.
 async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
     let requests_config = config
         .requests
@@ -908,6 +966,7 @@ async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
             pending_requests.push(request);
         }
     }
+    // Отпечаток набора используется GUI для подавления повторных уведомлений.
     let pending_fingerprint = pending_requests
         .iter()
         .map(|request| request.request_num.as_str())
@@ -929,6 +988,8 @@ async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
             continue;
         }
 
+        // Наличие неисполненного поручения означает, что согласование не готово.
+        // По умолчанию такая заявка остается видимой для следующего опроса.
         if request.por_neisp != 0 {
             warn!(
                 request_num = request.request_num,
@@ -942,6 +1003,8 @@ async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
             continue;
         }
 
+        // Сопоставление выполняется по имени заявителя из MSSQL. Неактивные
+        // записи mapping-файла никогда не получают доступ.
         let Some(employee) = mappings.employee.iter().find(|item| {
             item.enabled
                 && item
@@ -994,6 +1057,8 @@ async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
 }
 
 async fn run_loop(config: &AppConfig, apply: bool) -> Result<()> {
+    // CLI-цикл предназначен для длительного запуска как служба. Остановка по
+    // Ctrl+C обрабатывается без изменения состояния pfSense.
     loop {
         run_once(config, apply).await?;
         tokio::select! {
@@ -1054,6 +1119,8 @@ async fn run_once(config: &AppConfig, apply: bool) -> Result<()> {
 }
 
 async fn fetch_desired_operations(config: &SqlConfig) -> Result<Vec<DesiredOperation>> {
+    // Общий desired-state путь получает строки из MSSQL и превращает каждую
+    // строку в нормализованную REST-операцию.
     let connection_string = config.connection_string()?;
     let mssql = MssqlConfig::from_ado_string(&connection_string)
         .with_context(|| format!("parse {}", config.connection_string_env))?;
@@ -1089,6 +1156,8 @@ async fn fetch_remote_work_requests(
     config: &SqlConfig,
     query: &str,
 ) -> Result<Vec<RemoteWorkRequest>> {
+    // Запрос заявок хранится отдельным SQL-файлом, чтобы его можно было менять
+    // без перекомпиляции Rust-приложения.
     let connection_string = config.connection_string()?;
     let mssql = MssqlConfig::from_ado_string(&connection_string)
         .with_context(|| format!("parse {}", config.connection_string_env))?;
@@ -1121,6 +1190,8 @@ async fn fetch_remote_work_requests(
 }
 
 impl SqlConfig {
+    // Сначала используем переменную окружения. Резервное значение из TOML
+    // оставлено для совместимости, но секреты в обычный GUI-файл не попадают.
     fn connection_string(&self) -> Result<String> {
         match std::env::var(&self.connection_string_env) {
             Ok(value) => Ok(value),
@@ -1177,6 +1248,8 @@ fn remote_work_operation(
     request: &RemoteWorkRequest,
     employee: &EmployeeAccess,
 ) -> Result<DesiredOperation> {
+    // Тело REST-запроса строится из проверенной заявки и разрешенной записи
+    // workstation mapping, а не из произвольного пользовательского JSON.
     let template = config
         .pfsense
         .remote_work_access
@@ -1210,6 +1283,8 @@ fn render_remote_work_template(
     employee: &EmployeeAccess,
     rdp_port: u16,
 ) -> String {
+    // Подставляем значения с JSON-экранированием: шаблон остается JSON, а
+    // кавычки и спецсимволы в ФИО/причине не ломают тело запроса.
     let mut rendered = template.to_owned();
     let replacements = [
         ("request_num", request.request_num.as_str()),
@@ -1270,6 +1345,8 @@ fn get_optional_str(row: &tiberius::Row, name: &str) -> Option<String> {
 }
 
 fn hash_operation(method: &str, path: &str, body_json: Option<&str>) -> String {
+    // Хэш учитывает весь desired state. Изменение метода, URL или тела создает
+    // новую версию операции и не маскируется старой записью аудита.
     let mut hasher = Sha256::new();
     hasher.update(method.as_bytes());
     hasher.update(b"\n");
@@ -1286,6 +1363,8 @@ struct PfsenseClient {
 }
 
 impl PfsenseClient {
+    // Клиент создается только в APPLY-режиме. В dry-run токен не требуется,
+    // благодаря чему можно безопасно проверить MSSQL и сформированный план.
     fn new(config: &PfsenseConfig) -> Result<Self> {
         let token = std::env::var(&config.token_env)
             .with_context(|| format!("{} is required", config.token_env))?;
@@ -1304,6 +1383,8 @@ impl PfsenseClient {
     }
 
     async fn apply(&self, op: &DesiredOperation) -> Result<()> {
+        // URL строится только из базового API URL и path операции. Перед отправкой
+        // тело разбирается как JSON, поэтому некорректный шаблон отбрасывается.
         let method = Method::from_bytes(op.method.as_bytes())
             .with_context(|| format!("invalid HTTP method {}", op.method))?;
         let url = self
@@ -1353,6 +1434,8 @@ struct Audit {
 }
 
 impl Audit {
+    // SQLite-аудит делает повторные запуски идемпотентными и сохраняет историю
+    // как примененных REST-операций, так и обработанных заявок.
     fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open audit DB {path}"))?;
         conn.execute_batch(
