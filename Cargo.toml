@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 eframe = "0.29"
 keyring = { version = "3.6", default-features = false, features = ["windows-native"] }

@@ -2,17 +2,21 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use reqwest::{Client as HttpClient, Method};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tiberius::{Client as MssqlClient, Config as MssqlConfig};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing::{info, warn};
@@ -172,10 +176,14 @@ async fn main() -> Result<()> {
 const GUI_SERVICE: &str = "oz";
 const MSSQL_SECRET: &str = "mssql-connection-string";
 const PFSENSE_SECRET: &str = "pfsense-api-token";
+const XMPP_SECRET: &str = "xmpp-account-password";
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct GuiSettings {
     config_path: String,
+    poll_interval_seconds: String,
+    poll_enabled: bool,
     sql_server: String,
     sql_port: String,
     sql_database: String,
@@ -184,12 +192,18 @@ struct GuiSettings {
     mapping_file: String,
     query_file: String,
     audit_db_path: String,
+    xmpp_server: String,
+    xmpp_port: String,
+    xmpp_account: String,
+    xmpp_recipient: String,
 }
 
 impl Default for GuiSettings {
     fn default() -> Self {
         Self {
             config_path: "config.toml".to_owned(),
+            poll_interval_seconds: "60".to_owned(),
+            poll_enabled: true,
             sql_server: "srv-db".to_owned(),
             sql_port: "1433".to_owned(),
             sql_database: "rd_all".to_owned(),
@@ -198,6 +212,10 @@ impl Default for GuiSettings {
             mapping_file: "workstations.toml".to_owned(),
             query_file: "sql/remote_work_requests.sql".to_owned(),
             audit_db_path: "audit.sqlite3".to_owned(),
+            xmpp_server: "jabber.syk.sevnb.ru".to_owned(),
+            xmpp_port: "5222".to_owned(),
+            xmpp_account: "su_srv_zbx@dns.sevnb.ru".to_owned(),
+            xmpp_recipient: String::new(),
         }
     }
 }
@@ -206,10 +224,12 @@ struct GuiApp {
     settings: GuiSettings,
     mssql_password: String,
     pfsense_token: String,
+    xmpp_password: String,
     remember_secrets: bool,
     apply: bool,
     status: String,
     running: bool,
+    stop: Arc<AtomicBool>,
     result_rx: Receiver<String>,
     result_tx: Sender<String>,
 }
@@ -219,15 +239,18 @@ impl GuiApp {
         let settings = load_gui_settings().unwrap_or_default();
         let mssql_password = read_secret(MSSQL_SECRET).unwrap_or_default();
         let pfsense_token = read_secret(PFSENSE_SECRET).unwrap_or_default();
+        let xmpp_password = read_secret(XMPP_SECRET).unwrap_or_default();
         let (result_tx, result_rx) = mpsc::channel();
         Self {
             settings,
             mssql_password,
             pfsense_token,
+            xmpp_password,
             remember_secrets: true,
             apply: false,
             status: "Готово. Режим dry-run включен.".to_owned(),
             running: false,
+            stop: Arc::new(AtomicBool::new(false)),
             result_rx,
             result_tx,
         }
@@ -237,9 +260,11 @@ impl GuiApp {
         if self.running {
             return;
         }
+        self.stop = Arc::new(AtomicBool::new(false));
         let settings = self.settings.clone();
         let mssql_password = self.mssql_password.clone();
         let pfsense_token = self.pfsense_token.clone();
+        let xmpp_password = self.xmpp_password.clone();
         let apply = self.apply;
         let remember_secrets = self.remember_secrets;
         if let Err(error) = save_gui_settings(&settings)
@@ -248,6 +273,7 @@ impl GuiApp {
                 if remember_secrets {
                     save_secret(MSSQL_SECRET, &mssql_password)?;
                     save_secret(PFSENSE_SECRET, &pfsense_token)?;
+                    save_secret(XMPP_SECRET, &xmpp_password)?;
                 }
                 Ok(())
             })
@@ -258,49 +284,282 @@ impl GuiApp {
 
         let tx = self.result_tx.clone();
         let config_path = settings.config_path.clone();
+        let stop = Arc::clone(&self.stop);
         self.running = true;
-        self.status = if apply {
+        self.status = if settings.poll_enabled {
+            "Фоновый опрос запущен.".to_owned()
+        } else if apply {
             "Выполняется APPLY...".to_owned()
         } else {
             "Выполняется dry-run...".to_owned()
         };
         thread::spawn(move || {
-            let mut command = std::process::Command::new(
-                std::env::current_exe().unwrap_or_else(|_| PathBuf::from("oz.exe")),
-            );
-            command.args(["process-requests", "--config", &config_path, "--once"]);
-            if apply {
-                command.arg("--apply");
-            } else {
-                command.arg("--dry-run");
-            }
-            command.env(
-                "MSSQL_CONNECTION_STRING",
-                build_connection_string(&settings, &mssql_password),
-            );
-            command.env("PFSENSE_API_TOKEN", &pfsense_token);
-            let message = match command.output() {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if output.status.success() {
-                        format!("Готово.\n{}{}", stdout, stderr)
-                    } else {
-                        format!("Ошибка ({}).\n{}{}", output.status, stdout, stderr)
-                    }
+            let mut notified_fingerprint = String::new();
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
                 }
-                Err(error) => format!("Не удалось запустить обработчик: {error:#}"),
-            };
-            let _ = tx.send(message);
+                let message = run_gui_poll(
+                    &settings,
+                    &config_path,
+                    &mssql_password,
+                    &pfsense_token,
+                    &xmpp_password,
+                    apply,
+                    &mut notified_fingerprint,
+                );
+                let _ = tx.send(message);
+                if !settings.poll_enabled {
+                    break;
+                }
+                let interval = settings
+                    .poll_interval_seconds
+                    .parse::<u64>()
+                    .unwrap_or(60)
+                    .max(5);
+                for _ in 0..interval {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
         });
     }
+}
+
+impl Drop for GuiApp {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn run_gui_poll(
+    settings: &GuiSettings,
+    config_path: &str,
+    mssql_password: &str,
+    pfsense_token: &str,
+    xmpp_password: &str,
+    apply: bool,
+    notified_fingerprint: &mut String,
+) -> String {
+    let mut command = std::process::Command::new(
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("oz.exe")),
+    );
+    command.args(["process-requests", "--config", config_path, "--once"]);
+    if apply {
+        command.arg("--apply");
+    } else {
+        command.arg("--dry-run");
+    }
+    command.env(
+        "MSSQL_CONNECTION_STRING",
+        build_connection_string(settings, mssql_password),
+    );
+    command.env("PFSENSE_API_TOKEN", pfsense_token);
+
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(error) => return format!("Не удалось запустить обработчик: {error:#}"),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let result = stdout
+        .lines()
+        .find(|line| line.starts_with("OZ_RESULT "))
+        .and_then(parse_poll_result);
+
+    let mut message = if output.status.success() {
+        format!("Проверка завершена.\n{}{}", stdout, stderr)
+    } else {
+        format!("Ошибка ({}).\n{}{}", output.status, stdout, stderr)
+    };
+
+    if let Some((pending, fingerprint)) = result {
+        if pending == 0 {
+            notified_fingerprint.clear();
+        } else if fingerprint != *notified_fingerprint {
+            if settings.xmpp_recipient.trim().is_empty() {
+                *notified_fingerprint = fingerprint.clone();
+                message = format!(
+                    "OZ_FOCUS\nНайдено необработанных заявок: {pending}. Укажите JID получателя XMPP.\n{message}"
+                );
+            } else if xmpp_password.is_empty() {
+                *notified_fingerprint = fingerprint.clone();
+                message = format!(
+                    "OZ_FOCUS\nНайдено необработанных заявок: {pending}. Укажите пароль XMPP.\n{message}"
+                );
+            } else {
+                let body = format!(
+                    "ОЗ: обнаружено необработанных заявок: {pending}. Требуется проверка в приложении."
+                );
+                let xmpp_result = std::thread::Builder::new()
+                    .name("oz-xmpp".to_owned())
+                    .spawn({
+                        let server = settings.xmpp_server.clone();
+                        let port = settings.xmpp_port.clone();
+                        let account = settings.xmpp_account.clone();
+                        let recipient = settings.xmpp_recipient.clone();
+                        let password = xmpp_password.to_owned();
+                        move || {
+                            send_xmpp_message_blocking(
+                                &server, &port, &account, &password, &recipient, &body,
+                            )
+                        }
+                    })
+                    .map_err(|error| error.to_string())
+                    .and_then(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| "XMPP thread panicked".to_owned())
+                            .and_then(|result| result)
+                    });
+                match xmpp_result {
+                    Ok(()) => {
+                        *notified_fingerprint = fingerprint;
+                        message = format!(
+                            "OZ_FOCUS\nОтправлено уведомление в Miranda. Необработанных заявок: {pending}.\n{message}"
+                        );
+                    }
+                    Err(error) => {
+                        *notified_fingerprint = fingerprint.clone();
+                        message = format!(
+                            "OZ_FOCUS\nНе удалось отправить XMPP-уведомление: {error}\n{message}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    message
+}
+
+fn parse_poll_result(line: &str) -> Option<(usize, String)> {
+    let mut pending = None;
+    let mut fingerprint = None;
+    for item in line.split_whitespace().skip(1) {
+        let (key, value) = item.split_once('=')?;
+        match key {
+            "pending" => pending = value.parse().ok(),
+            "fingerprint" => fingerprint = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    Some((pending?, fingerprint?))
+}
+
+fn send_xmpp_message_blocking(
+    server: &str,
+    port: &str,
+    account: &str,
+    password: &str,
+    recipient: &str,
+    body: &str,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime
+        .block_on(send_xmpp_message(
+            server, port, account, password, recipient, body,
+        ))
+        .map_err(|error| format!("{error:#}"))
+}
+
+async fn send_xmpp_message(
+    server: &str,
+    port: &str,
+    account: &str,
+    password: &str,
+    recipient: &str,
+    body: &str,
+) -> Result<()> {
+    let (localpart, domain) = account
+        .split_once('@')
+        .context("XMPP account must be a full JID")?;
+    let port: u16 = port.parse().context("invalid XMPP port")?;
+    let mut stream = TcpStream::connect((server, port))
+        .await
+        .with_context(|| format!("connect XMPP {server}:{port}"))?;
+    let stream_open = format!(
+        "<stream:stream to='{domain}' xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' version='1.0'>"
+    );
+    stream.write_all(stream_open.as_bytes()).await?;
+    read_xmpp_until(&mut stream, "<stream:features", "XMPP features").await?;
+    let auth =
+        base64::engine::general_purpose::STANDARD.encode(format!("\0{localpart}\0{password}"));
+    stream
+        .write_all(
+            format!(
+                "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>{auth}</auth>"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    read_xmpp_until(&mut stream, "<success", "XMPP authentication").await?;
+    stream.write_all(stream_open.as_bytes()).await?;
+    read_xmpp_until(&mut stream, "<stream:features", "XMPP bind features").await?;
+    stream.write_all(b"<iq id='oz-bind-1' type='set'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>oz</resource></bind></iq>").await?;
+    read_xmpp_until(&mut stream, "oz-bind-1", "XMPP resource binding").await?;
+    let id = xml_escape(&format!("oz-{}", std::process::id()));
+    let recipient = xml_escape(recipient);
+    let body = xml_escape(body);
+    stream
+        .write_all(
+            format!(
+                "<message id='{id}' to='{recipient}' type='chat'><body>{body}</body></message>"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    stream.write_all(b"</stream:stream>").await?;
+    Ok(())
+}
+
+async fn read_xmpp_until(stream: &mut TcpStream, marker: &str, context: &str) -> Result<()> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 2048];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
+            .await
+            .with_context(|| format!("timeout during {context}"))??;
+        if read == 0 {
+            bail!("XMPP connection closed during {context}");
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if String::from_utf8_lossy(&buffer).contains(marker) {
+            return Ok(());
+        }
+        if buffer.len() > 128 * 1024 {
+            bail!("XMPP response is too large during {context}");
+        }
+    }
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         if let Ok(message) = self.result_rx.try_recv() {
-            self.running = false;
-            self.status = message;
+            if !self.settings.poll_enabled {
+                self.running = false;
+            }
+            if let Some(message) = message.strip_prefix("OZ_FOCUS\n") {
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+                self.status = message.to_owned();
+            } else {
+                self.status = message;
+            }
         }
         ctx.request_repaint_after(Duration::from_millis(250));
         eframe::egui::CentralPanel::default().show(ctx, |ui| {
@@ -326,6 +585,22 @@ impl eframe::App for GuiApp {
                         "Хранить секреты в Credential Manager",
                     );
                 });
+            eframe::egui::CollapsingHeader::new("Фоновый опрос и Miranda/XMPP")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.checkbox(&mut self.settings.poll_enabled, "Включить фоновый опрос");
+                    text_field(
+                        ui,
+                        "Интервал, секунд",
+                        &mut self.settings.poll_interval_seconds,
+                    );
+                    text_field(ui, "XMPP-сервер", &mut self.settings.xmpp_server);
+                    text_field(ui, "Порт XMPP", &mut self.settings.xmpp_port);
+                    text_field(ui, "JID учетной записи", &mut self.settings.xmpp_account);
+                    text_field(ui, "JID получателя", &mut self.settings.xmpp_recipient);
+                    password_field(ui, "Пароль XMPP", &mut self.xmpp_password);
+                    ui.label("Уведомление отправляется один раз для каждого нового набора заявок.");
+                });
             eframe::egui::CollapsingHeader::new("Файлы и параметры")
                 .default_open(true)
                 .show(ui, |ui| {
@@ -347,10 +622,18 @@ impl eframe::App for GuiApp {
                 );
             }
             if ui
-                .add_enabled(!self.running, eframe::egui::Button::new("Проверить заявки"))
+                .add_enabled(!self.running, eframe::egui::Button::new("Запустить опрос"))
                 .clicked()
             {
                 self.start();
+            }
+            if ui
+                .add_enabled(self.running, eframe::egui::Button::new("Остановить опрос"))
+                .clicked()
+            {
+                self.stop.store(true, Ordering::Relaxed);
+                self.running = false;
+                self.status = "Остановка фонового опроса...".to_owned();
             }
             ui.separator();
             ui.label("Статус");
@@ -422,9 +705,14 @@ fn build_connection_string(settings: &GuiSettings, password: &str) -> String {
 }
 
 fn write_runtime_config(settings: &GuiSettings) -> Result<()> {
+    let interval_seconds = settings
+        .poll_interval_seconds
+        .parse::<u64>()
+        .unwrap_or(60)
+        .max(5);
     let config = format!(
         r#"[runtime]
-interval_seconds = 60
+interval_seconds = {}
 audit_db_path = {:?}
 
 [mssql]
@@ -449,6 +737,7 @@ method = "POST"
 path = "/firewall/rule"
 body_template = "{{\"type\":\"pass\",\"interface\":\"openvpn\",\"ipprotocol\":\"inet\",\"protocol\":\"tcp\",\"source\":\"{{{{vpn_user}}}}\",\"destination\":\"{{{{workstation_host}}}}\",\"destination_port\":\"{{{{rdp_port}}}}\",\"descr\":\"remote-work {{{{request_num}}}} {{{{requester}}}} {{{{date_n}}}} {{{{time_n}}}}\"}}"
 "#,
+        interval_seconds,
         settings.audit_db_path,
         settings.sql_server,
         settings.sql_port,
@@ -468,7 +757,13 @@ fn run_gui() -> Result<()> {
     eframe::run_native(
         "ОЗ — отслеживание заявок",
         options,
-        Box::new(|_cc| Ok(Box::new(GuiApp::new()))),
+        Box::new(|_cc| {
+            let mut app = GuiApp::new();
+            if app.settings.poll_enabled {
+                app.start();
+            }
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|error| anyhow::anyhow!("GUI failed: {error}"))
 }
@@ -516,6 +811,23 @@ async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
 
     info!(count = requests.len(), "fetched remote work requests");
+    let mut pending_requests = Vec::new();
+    for request in &requests {
+        if !audit.is_request_processed(&request.request_num)? {
+            pending_requests.push(request);
+        }
+    }
+    let pending_fingerprint = pending_requests
+        .iter()
+        .map(|request| request.request_num.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    println!(
+        "OZ_RESULT fetched={} pending={} fingerprint={}",
+        requests.len(),
+        pending_requests.len(),
+        hash_operation("PENDING", "remote-work", Some(&pending_fingerprint))
+    );
 
     for request in requests {
         if audit.is_request_processed(&request.request_num)? {
@@ -1074,6 +1386,17 @@ mod tests {
             rendered,
             r#"{"source":"ivanov_i","destination":"10.32.5.121","port":3389,"descr":"42 2026-08-28"}"#
         );
+    }
+
+    #[test]
+    fn poll_result_is_parsed() {
+        let result = parse_poll_result("OZ_RESULT fetched=4 pending=2 fingerprint=abc123");
+        assert_eq!(result, Some((2, "abc123".to_owned())));
+    }
+
+    #[test]
+    fn xmpp_values_are_escaped() {
+        assert_eq!(xml_escape("a<&\"'"), "a&lt;&amp;&quot;&apos;");
     }
 
     #[test]

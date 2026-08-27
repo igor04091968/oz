@@ -72,12 +72,25 @@ GUI mode is available for desktop use:
 cargo run -- gui
 ```
 
-The GUI edits non-secret settings, stores the MSSQL password and pfSense API
-token in the operating system credential store, generates the runtime
-`config.toml`, and starts the same `process-requests` workflow. Dry-run is
-selected by default; enable APPLY only after reviewing the result. The
-application is intended to run directly on `WS-GST01`; it does not implement
-an RDP client. RDP is used only as the destination service in the pfSense rule.
+The GUI edits non-secret settings, stores the MSSQL password, pfSense API token
+and XMPP password in the operating system credential store, generates the
+runtime `config.toml`, and starts the same `process-requests` workflow.
+By default it polls every 60 seconds, sends one XMPP/Miranda notification to
+the configured recipient when the pending-request set changes, and brings its
+window to the foreground. Dry-run is selected by default; enable APPLY only
+after reviewing the result. The application is intended to run directly on
+`WS-GST01`; it does not implement an RDP client. RDP is used only as the
+destination service in the pfSense rule.
+
+The XMPP settings follow the ATS integration shape: server, port, bot account,
+recipient JID and password are configured separately. The current default is
+the internal ATS endpoint `jabber.syk.sevnb.ru:5222`; use it only on the
+trusted internal route because the current ATS-compatible mode does not enable
+TLS.
+
+The non-secret GUI settings can also be prepared from
+`gui-settings.example.toml`; copy it to `gui-settings.toml` and replace the
+recipient JID before starting the application.
 
 ```sh
 cargo run -- plan --config config.toml
