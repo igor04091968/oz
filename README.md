@@ -79,6 +79,17 @@ cargo run -- process-requests --config config.toml --once --apply
 `run` is the low-level desired-state mode. `process-requests` is the business
 workflow for remote-work requests.
 
+## Build
+
+Local release build:
+
+```sh
+cargo build --release
+```
+
+GitHub Actions builds and publishes a Windows artifact named
+`pfsense-mssql-orchestrator-windows-x86_64`.
+
 ## Safety Notes
 
 - Do not run `--apply` until the SQL query returns a small, reviewed result set.

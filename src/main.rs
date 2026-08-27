@@ -633,63 +633,6 @@ fn parse_base_url(raw: &str) -> Result<Url> {
     Url::parse(&normalized).context("parse pfsense.base_url")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pfsense_base_url_preserves_api_prefix() {
-        let base = parse_base_url("https://pfsense.example.local/api/v2").unwrap();
-        let url = base.join("firewall/rule").unwrap();
-
-        assert_eq!(
-            url.as_str(),
-            "https://pfsense.example.local/api/v2/firewall/rule"
-        );
-    }
-
-    #[test]
-    fn operation_hash_is_stable() {
-        let left = hash_operation("POST", "/firewall/rule", Some("{\"a\":1}"));
-        let right = hash_operation("POST", "/firewall/rule", Some("{\"a\":1}"));
-
-        assert_eq!(left, right);
-    }
-
-    #[test]
-    fn remote_work_template_renders_request_context() {
-        let request = RemoteWorkRequest {
-            request_num: "42".to_owned(),
-            requester: "Ivanov".to_owned(),
-            date_z: "2026-08-27".to_owned(),
-            date_n: "2026-08-28".to_owned(),
-            time_n: "09:00-18:00".to_owned(),
-            date_k: String::new(),
-            time_k: String::new(),
-            reason: "test".to_owned(),
-            por_neisp: 0,
-        };
-        let employee = EmployeeAccess {
-            requester: "Ivanov".to_owned(),
-            vpn_user: "ivanov_i".to_owned(),
-            workstation_host: "10.32.5.121".to_owned(),
-            enabled: true,
-        };
-
-        let rendered = render_remote_work_template(
-            r#"{"source":"{{vpn_user}}","destination":"{{workstation_host}}","port":{{rdp_port}},"descr":"{{request_num}} {{date_n}}"}"#,
-            &request,
-            &employee,
-            3389,
-        );
-
-        assert_eq!(
-            rendered,
-            r#"{"source":"ivanov_i","destination":"10.32.5.121","port":3389,"descr":"42 2026-08-28"}"#
-        );
-    }
-}
-
 struct Audit {
     conn: Connection,
 }
@@ -762,5 +705,62 @@ impl Audit {
             params![request.request_num, request.requester, status],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pfsense_base_url_preserves_api_prefix() {
+        let base = parse_base_url("https://pfsense.example.local/api/v2").unwrap();
+        let url = base.join("firewall/rule").unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://pfsense.example.local/api/v2/firewall/rule"
+        );
+    }
+
+    #[test]
+    fn operation_hash_is_stable() {
+        let left = hash_operation("POST", "/firewall/rule", Some("{\"a\":1}"));
+        let right = hash_operation("POST", "/firewall/rule", Some("{\"a\":1}"));
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn remote_work_template_renders_request_context() {
+        let request = RemoteWorkRequest {
+            request_num: "42".to_owned(),
+            requester: "Ivanov".to_owned(),
+            date_z: "2026-08-27".to_owned(),
+            date_n: "2026-08-28".to_owned(),
+            time_n: "09:00-18:00".to_owned(),
+            date_k: String::new(),
+            time_k: String::new(),
+            reason: "test".to_owned(),
+            por_neisp: 0,
+        };
+        let employee = EmployeeAccess {
+            requester: "Ivanov".to_owned(),
+            vpn_user: "ivanov_i".to_owned(),
+            workstation_host: "10.32.5.121".to_owned(),
+            enabled: true,
+        };
+
+        let rendered = render_remote_work_template(
+            r#"{"source":"{{vpn_user}}","destination":"{{workstation_host}}","port":{{rdp_port}},"descr":"{{request_num}} {{date_n}}"}"#,
+            &request,
+            &employee,
+            3389,
+        );
+
+        assert_eq!(
+            rendered,
+            r#"{"source":"ivanov_i","destination":"10.32.5.121","port":3389,"descr":"42 2026-08-28"}"#
+        );
     }
 }
