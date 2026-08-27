@@ -1,13 +1,15 @@
 # Windows Deployment
 
-Target host: `WS-GST01`.
+Target runtime: manual/on-demand launch from the user's desktop. Service mode is
+optional and should only be enabled after the manual workflow is validated.
 
 ## Layout
 
 ```text
-C:\Program Files\PfsenseMssqlOrchestrator\pfsense-mssql-orchestrator.exe
-C:\ProgramData\PfsenseMssqlOrchestrator\config.toml
-C:\ProgramData\PfsenseMssqlOrchestrator\audit.sqlite3
+C:\Tools\PfsenseMssqlOrchestrator\pfsense-mssql-orchestrator.exe
+C:\Tools\PfsenseMssqlOrchestrator\config.toml
+C:\Tools\PfsenseMssqlOrchestrator\workstations.toml
+C:\Tools\PfsenseMssqlOrchestrator\audit.sqlite3
 ```
 
 ## Environment
@@ -32,3 +34,9 @@ nssm start PfsenseMssqlOrchestrator
 The service is installed as manual start by default. Switch to automatic only
 after `--once --dry-run` and one controlled `--once --apply` have been validated.
 
+For normal desktop use, run manually instead:
+
+```powershell
+.\pfsense-mssql-orchestrator.exe process-requests --config .\config.toml --once --dry-run
+.\pfsense-mssql-orchestrator.exe process-requests --config .\config.toml --once --apply
+```

@@ -3,13 +3,17 @@
 Rust service for applying pfSense REST API changes from desired state stored in
 Microsoft SQL Server.
 
-Target installation host: `WS-GST01`. The application does not assume the
-developer laptop VPN route at runtime. SQL Server connectivity is provided by a
-configured MSSQL connection string on the workstation.
+Target runtime: manual/on-demand launch from the user's desktop. The expected
+workplace SQL Server is `srv-db`, database `rd_all`; the actual connection is
+provided by a configured MSSQL connection string.
 
 ## Scope
 
 - Read desired pfSense operations from MSSQL.
+- Read new remote-work requests from `srv-db` / `rd_all`.
+- Check approval completion through the request query's `por_neisp` flag.
+- Map request authors to OpenVPN users and their own workstations.
+- Grant OpenVPN-to-RDP access through pfSense API templates.
 - Build deterministic operation hashes.
 - Skip already-applied operations through local SQLite audit.
 - Support `--dry-run` by default for safe inspection.
@@ -50,8 +54,15 @@ export MSSQL_CONNECTION_STRING='server=tcp:SQL_HOST,1433;database=DB;user=USER;p
 export PFSENSE_API_TOKEN='...'
 ```
 
-On Windows, set these as Machine-level environment variables or inject them
-through the service wrapper used on `WS-GST01`.
+For this project the intended MSSQL target is:
+
+```text
+server=tcp:srv-db,1433;database=rd_all;...
+```
+
+Create a private `workstations.toml` from `workstations.example.toml`. It maps
+the request author field `ot_kogo` to a pfSense/OpenVPN user and workstation
+host/IP. Keep the private mapping out of git if it contains personal data.
 
 ## Commands
 
@@ -59,15 +70,20 @@ through the service wrapper used on `WS-GST01`.
 cargo run -- plan --config config.toml
 cargo run -- run --config config.toml --once --dry-run
 cargo run -- run --config config.toml --once --apply
+cargo run -- process-requests --config config.toml --once --dry-run
+cargo run -- process-requests --config config.toml --once --apply
 ```
 
 `--dry-run` is the operational default. `--apply` must be explicit.
+
+`run` is the low-level desired-state mode. `process-requests` is the business
+workflow for remote-work requests.
 
 ## Safety Notes
 
 - Do not run `--apply` until the SQL query returns a small, reviewed result set.
 - Start with read-only pfSense endpoints or a lab pfSense instance.
-- Verify from `WS-GST01` that SQL Server and pfSense API are reachable before
-  enabling the scheduled/service mode.
+- Verify from the desktop that SQL Server and pfSense API are reachable before
+  the first real `process-requests --apply`.
 - Prefer a dedicated MSSQL login with read-only access to the desired-state view.
 - Prefer a dedicated pfSense API token with the narrowest available privileges.

@@ -5,12 +5,12 @@ set @d1 = '20260801';
 set @d2 = '20260825';
 
 select
-    convert(date, d.date1) as date_z,      -- request date
-    d.num1,                                -- request number
+    convert(varchar(10), d.date1, 23) as date_z,  -- request date
+    convert(varchar(64), d.num1) as num1,          -- request number
     rtrim(d.pole4) as ot_kogo,             -- request author
-    convert(date, d.date3) as date_n,      -- first remote-work day
+    convert(varchar(10), d.date3, 23) as date_n,  -- first remote-work day
     rtrim(d.pole3) as time_n,              -- time period on first day
-    convert(date, d.date2) as date_k,      -- last day, empty for one-day requests
+    convert(varchar(10), d.date2, 23) as date_k,  -- last day, empty for one-day requests
     rtrim(d.pole2) as time_k,              -- time period on last day
     rtrim(d.pole1) as prich,               -- request reason
     isnull((

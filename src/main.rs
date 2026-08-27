@@ -24,6 +24,7 @@ struct Cli {
 enum Command {
     Plan(CommonArgs),
     Run(RunArgs),
+    ProcessRequests(RunArgs),
 }
 
 #[derive(Args, Clone)]
@@ -51,6 +52,7 @@ struct RunArgs {
 struct AppConfig {
     runtime: RuntimeConfig,
     mssql: SqlConfig,
+    requests: Option<RequestsConfig>,
     pfsense: PfsenseConfig,
 }
 
@@ -63,8 +65,17 @@ struct RuntimeConfig {
 #[derive(Debug, Deserialize)]
 struct SqlConfig {
     connection_string_env: String,
+    default_connection_string: Option<String>,
     query: Option<String>,
     query_file: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestsConfig {
+    query_file: String,
+    mapping_file: String,
+    rdp_port: u16,
+    mark_unapproved_as_seen: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +84,14 @@ struct PfsenseConfig {
     token_env: String,
     insecure_tls: bool,
     timeout_seconds: u64,
+    remote_work_access: Option<PfsenseOperationTemplate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PfsenseOperationTemplate {
+    method: String,
+    path: String,
+    body_template: String,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +102,32 @@ struct DesiredOperation {
     path: String,
     body_json: Option<String>,
     desired_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkstationMappings {
+    employee: Vec<EmployeeAccess>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmployeeAccess {
+    requester: String,
+    vpn_user: String,
+    workstation_host: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteWorkRequest {
+    request_num: String,
+    requester: String,
+    date_z: String,
+    date_n: String,
+    time_n: String,
+    date_k: String,
+    time_k: String,
+    reason: String,
+    por_neisp: i32,
 }
 
 #[tokio::main]
@@ -109,6 +154,10 @@ async fn main() -> Result<()> {
                 run_once(&config, apply).await
             }
         }
+        Command::ProcessRequests(args) => {
+            let config = load_config(&args.common.config)?;
+            process_requests(&config, args.apply).await
+        }
     }
 }
 
@@ -129,6 +178,94 @@ fn print_plan(config: &AppConfig) -> Result<()> {
     println!("Interval: {}s", config.runtime.interval_seconds);
     println!("pfSense token env: {}", config.pfsense.token_env);
     println!("SQL query source: {}", config.mssql.query_source());
+    if let Some(requests) = &config.requests {
+        println!("Requests query file: {}", requests.query_file);
+        println!("Workstation mapping file: {}", requests.mapping_file);
+        println!("RDP port: {}", requests.rdp_port);
+    }
+
+    Ok(())
+}
+
+async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
+    let requests_config = config
+        .requests
+        .as_ref()
+        .context("requests section is required for process-requests")?;
+    let mappings = load_workstation_mappings(&requests_config.mapping_file)?;
+    let audit = Audit::open(&config.runtime.audit_db_path)?;
+    let pfsense = PfsenseClient::new(&config.pfsense)?;
+    let query = fs::read_to_string(&requests_config.query_file)
+        .with_context(|| format!("read request query file {}", requests_config.query_file))?;
+    let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
+
+    info!(count = requests.len(), "fetched remote work requests");
+
+    for request in requests {
+        if audit.is_request_processed(&request.request_num)? {
+            info!(
+                request_num = request.request_num,
+                "request already processed"
+            );
+            continue;
+        }
+
+        if request.por_neisp != 0 {
+            warn!(
+                request_num = request.request_num,
+                requester = request.requester,
+                por_neisp = request.por_neisp,
+                "request approval is incomplete"
+            );
+            if requests_config.mark_unapproved_as_seen {
+                audit.record_request_skipped(&request, "approval_incomplete")?;
+            }
+            continue;
+        }
+
+        let Some(employee) = mappings.employee.iter().find(|item| {
+            item.enabled
+                && item
+                    .requester
+                    .eq_ignore_ascii_case(request.requester.trim())
+        }) else {
+            warn!(
+                request_num = request.request_num,
+                requester = request.requester,
+                "no enabled workstation mapping for requester"
+            );
+            continue;
+        };
+
+        let op = remote_work_operation(config, requests_config, &request, employee)?;
+
+        if audit.is_applied(&op.rule_key, &op.desired_hash)? {
+            audit.record_request_processed(&request, &op, "already_applied")?;
+            continue;
+        }
+
+        if !apply {
+            warn!(
+                request_num = request.request_num,
+                requester = request.requester,
+                vpn_user = employee.vpn_user,
+                workstation_host = employee.workstation_host,
+                "dry run: would grant OpenVPN RDP access"
+            );
+            continue;
+        }
+
+        pfsense.apply(&op).await?;
+        audit.record_applied(&op)?;
+        audit.record_request_processed(&request, &op, "applied")?;
+        info!(
+            request_num = request.request_num,
+            requester = request.requester,
+            vpn_user = employee.vpn_user,
+            workstation_host = employee.workstation_host,
+            "remote access granted"
+        );
+    }
 
     Ok(())
 }
@@ -186,8 +323,7 @@ async fn run_once(config: &AppConfig, apply: bool) -> Result<()> {
 }
 
 async fn fetch_desired_operations(config: &SqlConfig) -> Result<Vec<DesiredOperation>> {
-    let connection_string = std::env::var(&config.connection_string_env)
-        .with_context(|| format!("{} is required", config.connection_string_env))?;
+    let connection_string = config.connection_string()?;
     let mssql = MssqlConfig::from_ado_string(&connection_string)
         .with_context(|| format!("parse {}", config.connection_string_env))?;
 
@@ -218,7 +354,52 @@ async fn fetch_desired_operations(config: &SqlConfig) -> Result<Vec<DesiredOpera
     Ok(operations)
 }
 
+async fn fetch_remote_work_requests(
+    config: &SqlConfig,
+    query: &str,
+) -> Result<Vec<RemoteWorkRequest>> {
+    let connection_string = config.connection_string()?;
+    let mssql = MssqlConfig::from_ado_string(&connection_string)
+        .with_context(|| format!("parse {}", config.connection_string_env))?;
+
+    let tcp = TcpStream::connect(mssql.get_addr())
+        .await
+        .context("connect MSSQL")?;
+    tcp.set_nodelay(true).context("set MSSQL TCP_NODELAY")?;
+
+    let mut client = MssqlClient::connect(mssql, tcp.compat_write())
+        .await
+        .context("login MSSQL")?;
+
+    let rows = client
+        .simple_query(query)
+        .await
+        .context("execute MSSQL remote-work query")?
+        .into_results()
+        .await
+        .context("read MSSQL request rows")?;
+
+    let mut requests = Vec::new();
+    for result_set in rows {
+        for row in result_set {
+            requests.push(remote_work_request_from_row(row)?);
+        }
+    }
+
+    Ok(requests)
+}
+
 impl SqlConfig {
+    fn connection_string(&self) -> Result<String> {
+        match std::env::var(&self.connection_string_env) {
+            Ok(value) => Ok(value),
+            Err(_) => self
+                .default_connection_string
+                .clone()
+                .with_context(|| format!("{} is required", self.connection_string_env)),
+        }
+    }
+
     fn query_source(&self) -> &str {
         if self.query_file.is_some() {
             "query_file"
@@ -237,6 +418,92 @@ impl SqlConfig {
             (None, None) => bail!("one of mssql.query or mssql.query_file is required"),
         }
     }
+}
+
+fn load_workstation_mappings(path: &str) -> Result<WorkstationMappings> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("read workstation mapping {path}"))?;
+    toml::from_str(&raw).with_context(|| format!("parse workstation mapping {path}"))
+}
+
+fn remote_work_request_from_row(row: tiberius::Row) -> Result<RemoteWorkRequest> {
+    Ok(RemoteWorkRequest {
+        request_num: get_required_str(&row, "num1")?,
+        requester: get_required_str(&row, "ot_kogo")?,
+        date_z: get_optional_str(&row, "date_z").unwrap_or_default(),
+        date_n: get_optional_str(&row, "date_n").unwrap_or_default(),
+        time_n: get_optional_str(&row, "time_n").unwrap_or_default(),
+        date_k: get_optional_str(&row, "date_k").unwrap_or_default(),
+        time_k: get_optional_str(&row, "time_k").unwrap_or_default(),
+        reason: get_optional_str(&row, "prich").unwrap_or_default(),
+        por_neisp: row.get::<i32, _>("por_neisp").unwrap_or(1),
+    })
+}
+
+fn remote_work_operation(
+    config: &AppConfig,
+    requests_config: &RequestsConfig,
+    request: &RemoteWorkRequest,
+    employee: &EmployeeAccess,
+) -> Result<DesiredOperation> {
+    let template = config
+        .pfsense
+        .remote_work_access
+        .as_ref()
+        .context("pfsense.remote_work_access section is required")?;
+    let body_json = render_remote_work_template(
+        &template.body_template,
+        request,
+        employee,
+        requests_config.rdp_port,
+    );
+    let rule_key = format!("remote-work:{}:{}", request.request_num, employee.vpn_user);
+    let action = "grant_openvpn_rdp".to_owned();
+    let method = template.method.to_uppercase();
+    let path = template.path.clone();
+    let desired_hash = hash_operation(&method, &path, Some(&body_json));
+
+    Ok(DesiredOperation {
+        rule_key,
+        action,
+        method,
+        path,
+        body_json: Some(body_json),
+        desired_hash,
+    })
+}
+
+fn render_remote_work_template(
+    template: &str,
+    request: &RemoteWorkRequest,
+    employee: &EmployeeAccess,
+    rdp_port: u16,
+) -> String {
+    let mut rendered = template.to_owned();
+    let replacements = [
+        ("request_num", request.request_num.as_str()),
+        ("requester", request.requester.as_str()),
+        ("vpn_user", employee.vpn_user.as_str()),
+        ("workstation_host", employee.workstation_host.as_str()),
+        ("date_z", request.date_z.as_str()),
+        ("date_n", request.date_n.as_str()),
+        ("time_n", request.time_n.as_str()),
+        ("date_k", request.date_k.as_str()),
+        ("time_k", request.time_k.as_str()),
+        ("reason", request.reason.as_str()),
+    ];
+
+    for (key, value) in replacements {
+        rendered = rendered.replace(&format!("{{{{{key}}}}}"), &json_escape(value));
+    }
+    rendered.replace("{{rdp_port}}", &rdp_port.to_string())
+}
+
+fn json_escape(value: &str) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "\"\"".to_owned())
+        .trim_matches('"')
+        .to_owned()
 }
 
 fn operation_from_row(row: tiberius::Row) -> Result<DesiredOperation> {
@@ -372,6 +639,39 @@ mod tests {
 
         assert_eq!(left, right);
     }
+
+    #[test]
+    fn remote_work_template_renders_request_context() {
+        let request = RemoteWorkRequest {
+            request_num: "42".to_owned(),
+            requester: "Ivanov".to_owned(),
+            date_z: "2026-08-27".to_owned(),
+            date_n: "2026-08-28".to_owned(),
+            time_n: "09:00-18:00".to_owned(),
+            date_k: String::new(),
+            time_k: String::new(),
+            reason: "test".to_owned(),
+            por_neisp: 0,
+        };
+        let employee = EmployeeAccess {
+            requester: "Ivanov".to_owned(),
+            vpn_user: "ivanov_i".to_owned(),
+            workstation_host: "10.32.5.121".to_owned(),
+            enabled: true,
+        };
+
+        let rendered = render_remote_work_template(
+            r#"{"source":"{{vpn_user}}","destination":"{{workstation_host}}","port":{{rdp_port}},"descr":"{{request_num}} {{date_n}}"}"#,
+            &request,
+            &employee,
+            3389,
+        );
+
+        assert_eq!(
+            rendered,
+            r#"{"source":"ivanov_i","destination":"10.32.5.121","port":3389,"descr":"42 2026-08-28"}"#
+        );
+    }
 }
 
 struct Audit {
@@ -388,6 +688,13 @@ impl Audit {
                 action text not null,
                 applied_at text not null default current_timestamp,
                 primary key (rule_key, desired_hash)
+            );
+            create table if not exists processed_requests (
+                request_num text primary key,
+                requester text not null,
+                rule_key text,
+                status text not null,
+                processed_at text not null default current_timestamp
             );",
         )
         .context("migrate audit DB")?;
@@ -407,6 +714,36 @@ impl Audit {
         self.conn.execute(
             "insert or ignore into applied_operations (rule_key, desired_hash, action) values (?1, ?2, ?3)",
             params![op.rule_key, op.desired_hash, op.action],
+        )?;
+        Ok(())
+    }
+
+    fn is_request_processed(&self, request_num: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "select count(*) from processed_requests where request_num = ?1",
+            params![request_num],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn record_request_processed(
+        &self,
+        request: &RemoteWorkRequest,
+        op: &DesiredOperation,
+        status: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "insert or replace into processed_requests (request_num, requester, rule_key, status) values (?1, ?2, ?3, ?4)",
+            params![request.request_num, request.requester, op.rule_key, status],
+        )?;
+        Ok(())
+    }
+
+    fn record_request_skipped(&self, request: &RemoteWorkRequest, status: &str) -> Result<()> {
+        self.conn.execute(
+            "insert or replace into processed_requests (request_num, requester, rule_key, status) values (?1, ?2, null, ?3)",
+            params![request.request_num, request.requester, status],
         )?;
         Ok(())
     }

@@ -1,6 +1,7 @@
 /target
 /.env
 /config.toml
+/workstations.toml
 /*.db
 /*.sqlite
 /*.sqlite3
