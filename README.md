@@ -82,8 +82,12 @@ after reviewing the result. The application is intended to run directly on
 `WS-GST01`; it does not implement an RDP client. RDP is used only as the
 destination service in the pfSense rule.
 
-The XMPP settings follow the ATS integration shape: server, port, bot account,
-recipient JID and password are configured separately. The current default is
+The XMPP settings follow the ATS integration shape: server, port, OZ account,
+recipient JID and password are configured separately. The default OZ caller
+identity is `oz@dns.sevnb.ru`, mapped in the ATS `sippeers` table to test
+extension `1000`.
+The GUI can send a click-to-call command to `pbx` for a numeric extension,
+workstation or JID target. The current default is
 the internal ATS endpoint `jabber.syk.sevnb.ru:5222`; use it only on the
 trusted internal route because the current ATS-compatible mode does not enable
 TLS.

@@ -196,6 +196,9 @@ struct GuiSettings {
     xmpp_port: String,
     xmpp_account: String,
     xmpp_recipient: String,
+    xmpp_call_recipient: String,
+    xmpp_caller_extension: String,
+    call_target: String,
 }
 
 impl Default for GuiSettings {
@@ -214,8 +217,11 @@ impl Default for GuiSettings {
             audit_db_path: "audit.sqlite3".to_owned(),
             xmpp_server: "jabber.syk.sevnb.ru".to_owned(),
             xmpp_port: "5222".to_owned(),
-            xmpp_account: "su_srv_zbx@dns.sevnb.ru".to_owned(),
+            xmpp_account: "oz@dns.sevnb.ru".to_owned(),
             xmpp_recipient: String::new(),
+            xmpp_call_recipient: "pbx@dns.sevnb.ru".to_owned(),
+            xmpp_caller_extension: "1000".to_owned(),
+            call_target: String::new(),
         }
     }
 }
@@ -324,6 +330,32 @@ impl GuiApp {
                     thread::sleep(Duration::from_secs(1));
                 }
             }
+        });
+    }
+
+    fn start_call(&mut self) {
+        let target = self.settings.call_target.trim().to_owned();
+        if let Err(error) = validate_call_target(&target) {
+            self.status = format!("Звонок не отправлен: {error}");
+            return;
+        }
+        let server = self.settings.xmpp_server.clone();
+        let port = self.settings.xmpp_port.clone();
+        let account = self.settings.xmpp_account.clone();
+        let password = self.xmpp_password.clone();
+        let recipient = self.settings.xmpp_call_recipient.clone();
+        let tx = self.result_tx.clone();
+        self.status = format!("Отправка команды звонка на {target}...");
+        thread::spawn(move || {
+            let result =
+                send_xmpp_call_blocking(&server, &port, &account, &password, &recipient, &target);
+            let message = match result {
+                Ok(()) => {
+                    format!("OZ_FOCUS\nКоманда звонка отправлена на {target} от номера 1000.")
+                }
+                Err(error) => format!("Звонок не отправлен: {error}"),
+            };
+            let _ = tx.send(message);
         });
     }
 }
@@ -468,6 +500,41 @@ fn send_xmpp_message_blocking(
         .map_err(|error| format!("{error:#}"))
 }
 
+fn send_xmpp_call_blocking(
+    server: &str,
+    port: &str,
+    account: &str,
+    password: &str,
+    recipient: &str,
+    target: &str,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime
+        .block_on(send_xmpp_message(
+            server,
+            port,
+            account,
+            password,
+            recipient,
+            &format!("Позвонить {target}"),
+        ))
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn validate_call_target(target: &str) -> Result<()> {
+    if target.is_empty() {
+        bail!("цель звонка не указана")
+    }
+    if target.len() > 128 || target.chars().any(char::is_control) {
+        bail!("недопустимая цель звонка")
+    }
+    Ok(())
+}
+
 async fn send_xmpp_message(
     server: &str,
     port: &str,
@@ -598,7 +665,31 @@ impl eframe::App for GuiApp {
                     text_field(ui, "Порт XMPP", &mut self.settings.xmpp_port);
                     text_field(ui, "JID учетной записи", &mut self.settings.xmpp_account);
                     text_field(ui, "JID получателя", &mut self.settings.xmpp_recipient);
+                    text_field(
+                        ui,
+                        "JID АТС для звонка",
+                        &mut self.settings.xmpp_call_recipient,
+                    );
                     password_field(ui, "Пароль XMPP", &mut self.xmpp_password);
+                    ui.label(format!(
+                        "Источник click-to-call: {} (JID OZ)",
+                        self.settings.xmpp_caller_extension
+                    ));
+                    text_field(
+                        ui,
+                        "Цель звонка (номер/WS/JID)",
+                        &mut self.settings.call_target,
+                    );
+                    if ui
+                        .add_enabled(
+                            !self.settings.call_target.trim().is_empty()
+                                && !self.xmpp_password.is_empty(),
+                            eframe::egui::Button::new("Позвонить"),
+                        )
+                        .clicked()
+                    {
+                        self.start_call();
+                    }
                     ui.label("Уведомление отправляется один раз для каждого нового набора заявок.");
                 });
             eframe::egui::CollapsingHeader::new("Файлы и параметры")
@@ -1397,6 +1488,13 @@ mod tests {
     #[test]
     fn xmpp_values_are_escaped() {
         assert_eq!(xml_escape("a<&\"'"), "a&lt;&amp;&quot;&apos;");
+    }
+
+    #[test]
+    fn call_target_validation_rejects_control_chars_and_empty_values() {
+        assert!(validate_call_target("").is_err());
+        assert!(validate_call_target("WS-GST01\n").is_err());
+        assert!(validate_call_target("135").is_ok());
     }
 
     #[test]
