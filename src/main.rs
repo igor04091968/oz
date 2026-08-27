@@ -194,7 +194,11 @@ async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
         .context("requests section is required for process-requests")?;
     let mappings = load_workstation_mappings(&requests_config.mapping_file)?;
     let audit = Audit::open(&config.runtime.audit_db_path)?;
-    let pfsense = PfsenseClient::new(&config.pfsense)?;
+    let pfsense = if apply {
+        Some(PfsenseClient::new(&config.pfsense)?)
+    } else {
+        None
+    };
     let query = fs::read_to_string(&requests_config.query_file)
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
@@ -255,7 +259,11 @@ async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
             continue;
         }
 
-        pfsense.apply(&op).await?;
+        pfsense
+            .as_ref()
+            .context("pfSense client is required when --apply is used")?
+            .apply(&op)
+            .await?;
         audit.record_applied(&op)?;
         audit.record_request_processed(&request, &op, "applied")?;
         info!(
@@ -286,7 +294,11 @@ async fn run_loop(config: &AppConfig, apply: bool) -> Result<()> {
 async fn run_once(config: &AppConfig, apply: bool) -> Result<()> {
     let audit = Audit::open(&config.runtime.audit_db_path)?;
     let operations = fetch_desired_operations(&config.mssql).await?;
-    let pfsense = PfsenseClient::new(&config.pfsense)?;
+    let pfsense = if apply {
+        Some(PfsenseClient::new(&config.pfsense)?)
+    } else {
+        None
+    };
 
     for op in operations {
         if audit.is_applied(&op.rule_key, &op.desired_hash)? {
@@ -310,7 +322,11 @@ async fn run_once(config: &AppConfig, apply: bool) -> Result<()> {
             continue;
         }
 
-        pfsense.apply(&op).await?;
+        pfsense
+            .as_ref()
+            .context("pfSense client is required when --apply is used")?
+            .apply(&op)
+            .await?;
         audit.record_applied(&op)?;
         info!(
             rule_key = op.rule_key,

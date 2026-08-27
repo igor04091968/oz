@@ -85,5 +85,9 @@ workflow for remote-work requests.
 - Start with read-only pfSense endpoints or a lab pfSense instance.
 - Verify from the desktop that SQL Server and pfSense API are reachable before
   the first real `process-requests --apply`.
+- Current pfSense REST API base URL is expected to be
+  `https://10.35.0.1:8443/api/v2`. From the laptop, HTTP/80 redirects there,
+  but HTTPS/8443 currently times out through the SNB VPN path; validate from
+  the desktop runtime host.
 - Prefer a dedicated MSSQL login with read-only access to the desired-state view.
 - Prefer a dedicated pfSense API token with the narrowest available privileges.
