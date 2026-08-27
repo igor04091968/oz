@@ -1,0 +1,24 @@
+[runtime]
+interval_seconds = 60
+audit_db_path = "C:\\ProgramData\\PfsenseMssqlOrchestrator\\audit.sqlite3"
+
+[mssql]
+connection_string_env = "MSSQL_CONNECTION_STRING"
+query = """
+select
+  rule_key,
+  action,
+  method,
+  path,
+  body_json,
+  desired_hash
+from dbo.PfsenseDesiredState
+where enabled = 1
+order by rule_key
+"""
+
+[pfsense]
+base_url = "https://pfsense.example.local/api/v2"
+token_env = "PFSENSE_API_TOKEN"
+insecure_tls = false
+timeout_seconds = 15

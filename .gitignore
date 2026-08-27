@@ -1,0 +1,7 @@
+/target
+/.env
+/config.toml
+/*.db
+/*.sqlite
+/*.sqlite3
+*.log
