@@ -66,6 +66,17 @@ host/IP. Keep the private mapping out of git if it contains personal data.
 
 ## Commands
 
+GUI mode is available for desktop use:
+
+```sh
+cargo run -- gui
+```
+
+The GUI edits non-secret settings, stores the MSSQL password and pfSense API
+token in the operating system credential store, generates the runtime
+`config.toml`, and starts the same `process-requests` workflow. Dry-run is
+selected by default; enable APPLY only after reviewing the result.
+
 ```sh
 cargo run -- plan --config config.toml
 cargo run -- run --config config.toml --once --dry-run

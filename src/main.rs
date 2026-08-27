@@ -1,4 +1,7 @@
 use std::fs;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -25,6 +28,7 @@ enum Command {
     Plan(CommonArgs),
     Run(RunArgs),
     ProcessRequests(RunArgs),
+    Gui,
 }
 
 #[derive(Args, Clone)]
@@ -158,7 +162,316 @@ async fn main() -> Result<()> {
             let config = load_config(&args.common.config)?;
             process_requests(&config, args.apply).await
         }
+        Command::Gui => run_gui(),
     }
+}
+
+const GUI_SERVICE: &str = "pfsense-mssql-orchestrator";
+const MSSQL_SECRET: &str = "mssql-connection-string";
+const PFSENSE_SECRET: &str = "pfsense-api-token";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct GuiSettings {
+    config_path: String,
+    sql_server: String,
+    sql_port: String,
+    sql_database: String,
+    sql_user: String,
+    pfsense_url: String,
+    mapping_file: String,
+    query_file: String,
+    audit_db_path: String,
+    rdp_port: String,
+}
+
+impl Default for GuiSettings {
+    fn default() -> Self {
+        Self {
+            config_path: "config.toml".to_owned(),
+            sql_server: "srv-db".to_owned(),
+            sql_port: "1433".to_owned(),
+            sql_database: "rd_all".to_owned(),
+            sql_user: String::new(),
+            pfsense_url: "https://10.35.0.1:8443/api/v2".to_owned(),
+            mapping_file: "workstations.toml".to_owned(),
+            query_file: "sql/remote_work_requests.sql".to_owned(),
+            audit_db_path: "audit.sqlite3".to_owned(),
+            rdp_port: "3389".to_owned(),
+        }
+    }
+}
+
+struct GuiApp {
+    settings: GuiSettings,
+    mssql_password: String,
+    pfsense_token: String,
+    remember_secrets: bool,
+    apply: bool,
+    status: String,
+    running: bool,
+    result_rx: Receiver<String>,
+    result_tx: Sender<String>,
+}
+
+impl GuiApp {
+    fn new() -> Self {
+        let settings = load_gui_settings().unwrap_or_default();
+        let mssql_password = read_secret(MSSQL_SECRET).unwrap_or_default();
+        let pfsense_token = read_secret(PFSENSE_SECRET).unwrap_or_default();
+        let (result_tx, result_rx) = mpsc::channel();
+        Self {
+            settings,
+            mssql_password,
+            pfsense_token,
+            remember_secrets: true,
+            apply: false,
+            status: "Готово. Режим dry-run включен.".to_owned(),
+            running: false,
+            result_rx,
+            result_tx,
+        }
+    }
+
+    fn start(&mut self) {
+        if self.running {
+            return;
+        }
+        let settings = self.settings.clone();
+        let mssql_password = self.mssql_password.clone();
+        let pfsense_token = self.pfsense_token.clone();
+        let apply = self.apply;
+        let remember_secrets = self.remember_secrets;
+        if let Err(error) = save_gui_settings(&settings)
+            .and_then(|_| write_runtime_config(&settings))
+            .and_then(|_| {
+                if remember_secrets {
+                    save_secret(MSSQL_SECRET, &mssql_password)?;
+                    save_secret(PFSENSE_SECRET, &pfsense_token)?;
+                }
+                Ok(())
+            })
+        {
+            self.status = format!("Ошибка сохранения: {error:#}");
+            return;
+        }
+
+        let tx = self.result_tx.clone();
+        let config_path = settings.config_path.clone();
+        self.running = true;
+        self.status = if apply {
+            "Выполняется APPLY...".to_owned()
+        } else {
+            "Выполняется dry-run...".to_owned()
+        };
+        thread::spawn(move || {
+            let mut command = std::process::Command::new(
+                std::env::current_exe()
+                    .unwrap_or_else(|_| PathBuf::from("pfsense-mssql-orchestrator.exe")),
+            );
+            command.args(["process-requests", "--config", &config_path, "--once"]);
+            if apply {
+                command.arg("--apply");
+            } else {
+                command.arg("--dry-run");
+            }
+            command.env(
+                "MSSQL_CONNECTION_STRING",
+                build_connection_string(&settings, &mssql_password),
+            );
+            command.env("PFSENSE_API_TOKEN", &pfsense_token);
+            let message = match command.output() {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if output.status.success() {
+                        format!("Готово.\n{}{}", stdout, stderr)
+                    } else {
+                        format!("Ошибка ({}).\n{}{}", output.status, stdout, stderr)
+                    }
+                }
+                Err(error) => format!("Не удалось запустить обработчик: {error:#}"),
+            };
+            let _ = tx.send(message);
+        });
+    }
+}
+
+impl eframe::App for GuiApp {
+    fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
+        if let Ok(message) = self.result_rx.try_recv() {
+            self.running = false;
+            self.status = message;
+        }
+        ctx.request_repaint_after(Duration::from_millis(250));
+        eframe::egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("pfSense MSSQL Orchestrator");
+            ui.label("Подключения, параметры обработки и журнал запуска");
+            ui.separator();
+            eframe::egui::CollapsingHeader::new("MSSQL")
+                .default_open(true)
+                .show(ui, |ui| {
+                    text_field(ui, "Сервер", &mut self.settings.sql_server);
+                    text_field(ui, "Порт", &mut self.settings.sql_port);
+                    text_field(ui, "База", &mut self.settings.sql_database);
+                    text_field(ui, "Пользователь", &mut self.settings.sql_user);
+                    password_field(ui, "Пароль", &mut self.mssql_password);
+                });
+            eframe::egui::CollapsingHeader::new("pfSense REST API")
+                .default_open(true)
+                .show(ui, |ui| {
+                    text_field(ui, "URL API", &mut self.settings.pfsense_url);
+                    password_field(ui, "API token", &mut self.pfsense_token);
+                    ui.checkbox(
+                        &mut self.remember_secrets,
+                        "Хранить секреты в Credential Manager",
+                    );
+                });
+            eframe::egui::CollapsingHeader::new("Файлы и параметры")
+                .default_open(true)
+                .show(ui, |ui| {
+                    text_field(ui, "Конфигурация", &mut self.settings.config_path);
+                    text_field(ui, "SQL запрос", &mut self.settings.query_file);
+                    text_field(
+                        ui,
+                        "Сопоставление сотрудников",
+                        &mut self.settings.mapping_file,
+                    );
+                    text_field(ui, "Журнал SQLite", &mut self.settings.audit_db_path);
+                    text_field(ui, "Порт RDP", &mut self.settings.rdp_port);
+                });
+            ui.separator();
+            ui.checkbox(&mut self.apply, "Применять изменения в pfSense (APPLY)");
+            if self.apply {
+                ui.colored_label(
+                    eframe::egui::Color32::RED,
+                    "Внимание: будут изменены правила pfSense",
+                );
+            }
+            if ui
+                .add_enabled(!self.running, eframe::egui::Button::new("Проверить заявки"))
+                .clicked()
+            {
+                self.start();
+            }
+            ui.separator();
+            ui.label("Статус");
+            eframe::egui::ScrollArea::vertical()
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    ui.monospace(&self.status);
+                });
+        });
+    }
+}
+
+fn text_field(ui: &mut eframe::egui::Ui, label: &str, value: &mut String) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.text_edit_singleline(value);
+    });
+}
+
+fn password_field(ui: &mut eframe::egui::Ui, label: &str, value: &mut String) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(eframe::egui::TextEdit::singleline(value).password(true));
+    });
+}
+
+fn gui_settings_path() -> PathBuf {
+    PathBuf::from("gui-settings.toml")
+}
+
+fn load_gui_settings() -> Result<GuiSettings> {
+    let raw = fs::read_to_string(gui_settings_path()).context("read GUI settings")?;
+    toml::from_str(&raw).context("parse GUI settings")
+}
+
+fn save_gui_settings(settings: &GuiSettings) -> Result<()> {
+    fs::write(gui_settings_path(), toml::to_string_pretty(settings)?).context("write GUI settings")
+}
+
+fn secret_entry(name: &str) -> Result<keyring::Entry> {
+    keyring::Entry::new(GUI_SERVICE, name).context("create credential entry")
+}
+
+fn read_secret(name: &str) -> Result<String> {
+    secret_entry(name)?
+        .get_password()
+        .context("read credential")
+}
+
+fn save_secret(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    secret_entry(name)?
+        .set_password(value)
+        .context("save credential")
+}
+
+fn build_connection_string(settings: &GuiSettings, password: &str) -> String {
+    let auth = if settings.sql_user.trim().is_empty() {
+        "Integrated Security=true".to_owned()
+    } else {
+        format!("user id={};password={}", settings.sql_user, password)
+    };
+    format!(
+        "server=tcp:{},{};database={};{};TrustServerCertificate=true",
+        settings.sql_server, settings.sql_port, settings.sql_database, auth
+    )
+}
+
+fn write_runtime_config(settings: &GuiSettings) -> Result<()> {
+    let config = format!(
+        r#"[runtime]
+interval_seconds = 60
+audit_db_path = {:?}
+
+[mssql]
+connection_string_env = "MSSQL_CONNECTION_STRING"
+default_connection_string = "server=tcp:{},{};database={};TrustServerCertificate=true"
+query_file = "{}"
+
+[requests]
+query_file = {:?}
+mapping_file = {:?}
+rdp_port = {}
+mark_unapproved_as_seen = false
+
+[pfsense]
+base_url = {:?}
+token_env = "PFSENSE_API_TOKEN"
+insecure_tls = true
+timeout_seconds = 15
+
+[pfsense.remote_work_access]
+method = "POST"
+path = "/firewall/rule"
+body_template = "{{\"type\":\"pass\",\"interface\":\"openvpn\",\"ipprotocol\":\"inet\",\"protocol\":\"tcp\",\"source\":\"{{{{vpn_user}}}}\",\"destination\":\"{{{{workstation_host}}}}\",\"destination_port\":\"{{{{rdp_port}}}}\",\"descr\":\"remote-work {{{{request_num}}}} {{{{requester}}}} {{{{date_n}}}} {{{{time_n}}}}\"}}"
+"#,
+        settings.audit_db_path,
+        settings.sql_server,
+        settings.sql_port,
+        settings.sql_database,
+        settings.query_file,
+        settings.query_file,
+        settings.mapping_file,
+        settings.rdp_port.parse::<u16>().unwrap_or(3389),
+        settings.pfsense_url
+    );
+    fs::write(&settings.config_path, config)
+        .with_context(|| format!("write {}", settings.config_path))
+}
+
+fn run_gui() -> Result<()> {
+    let options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "pfSense MSSQL Orchestrator",
+        options,
+        Box::new(|_cc| Ok(Box::new(GuiApp::new()))),
+    )
+    .map_err(|error| anyhow::anyhow!("GUI failed: {error}"))
 }
 
 fn load_config(path: &str) -> Result<AppConfig> {
@@ -762,5 +1075,25 @@ mod tests {
             rendered,
             r#"{"source":"ivanov_i","destination":"10.32.5.121","port":3389,"descr":"42 2026-08-28"}"#
         );
+    }
+
+    #[test]
+    fn gui_runtime_config_is_valid_toml_without_secrets() {
+        let mut settings = GuiSettings::default();
+        let path = std::env::temp_dir().join(format!(
+            "pfsense-mssql-orchestrator-test-{}.toml",
+            std::process::id()
+        ));
+        settings.config_path = path.to_string_lossy().into_owned();
+        write_runtime_config(&settings).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        let config: AppConfig = toml::from_str(&raw).unwrap();
+        let _ = fs::remove_file(path);
+        assert_eq!(
+            config.mssql.connection_string_env,
+            "MSSQL_CONNECTION_STRING"
+        );
+        assert!(!raw.contains("password"));
+        assert!(!raw.contains(PFSENSE_SECRET));
     }
 }
