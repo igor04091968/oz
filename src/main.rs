@@ -20,7 +20,7 @@ use url::Url;
 #[command(version, about = "Apply pfSense REST API desired state from MSSQL")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -144,11 +144,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Plan(args) => {
+        None => run_gui(),
+        Some(Command::Plan(args)) => {
             let config = load_config(&args.config)?;
             print_plan(&config)
         }
-        Command::Run(args) => {
+        Some(Command::Run(args)) => {
             let config = load_config(&args.common.config)?;
             let apply = args.apply;
 
@@ -158,11 +159,11 @@ async fn main() -> Result<()> {
                 run_once(&config, apply).await
             }
         }
-        Command::ProcessRequests(args) => {
+        Some(Command::ProcessRequests(args)) => {
             let config = load_config(&args.common.config)?;
             process_requests(&config, args.apply).await
         }
-        Command::Gui => run_gui(),
+        Some(Command::Gui) => run_gui(),
     }
 }
 
