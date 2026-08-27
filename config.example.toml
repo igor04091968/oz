@@ -17,6 +17,9 @@ where enabled = 1
 order by rule_key
 """
 
+# The current source query for remote-work requests is documented separately:
+# sql/remote_work_requests.sql
+
 [pfsense]
 base_url = "https://pfsense.example.local/api/v2"
 token_env = "PFSENSE_API_TOKEN"

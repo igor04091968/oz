@@ -18,7 +18,14 @@ configured MSSQL connection string on the workstation.
 
 ## Expected MSSQL Shape
 
-The configured query must return these columns:
+There are two layers:
+
+1. Source request query: [sql/remote_work_requests.sql](sql/remote_work_requests.sql)
+   returns raw remote-work requests from the workplace MSSQL database.
+2. Desired-state query: the later production query must return normalized
+   pfSense operations.
+
+The desired-state query must return these columns:
 
 | Column | Required | Meaning |
 |---|---:|---|
@@ -28,6 +35,9 @@ The configured query must return these columns:
 | `path` | yes | pfSense API path, for example `/firewall/rule` |
 | `body_json` | no | JSON body for methods that need a payload |
 | `desired_hash` | no | external state hash; if absent, the service hashes method/path/body |
+
+See [docs/REMOTE_WORK_SQL_CONTRACT_RU.md](docs/REMOTE_WORK_SQL_CONTRACT_RU.md)
+for the current source-query contract.
 
 ## Configuration
 

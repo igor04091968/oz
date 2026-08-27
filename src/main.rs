@@ -63,7 +63,8 @@ struct RuntimeConfig {
 #[derive(Debug, Deserialize)]
 struct SqlConfig {
     connection_string_env: String,
-    query: String,
+    query: Option<String>,
+    query_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +128,7 @@ fn print_plan(config: &AppConfig) -> Result<()> {
     println!("Audit DB: {}", config.runtime.audit_db_path);
     println!("Interval: {}s", config.runtime.interval_seconds);
     println!("pfSense token env: {}", config.pfsense.token_env);
+    println!("SQL query source: {}", config.mssql.query_source());
 
     Ok(())
 }
@@ -199,7 +201,7 @@ async fn fetch_desired_operations(config: &SqlConfig) -> Result<Vec<DesiredOpera
         .context("login MSSQL")?;
 
     let rows = client
-        .simple_query(&config.query)
+        .simple_query(config.load_query()?.as_str())
         .await
         .context("execute MSSQL desired-state query")?
         .into_results()
@@ -214,6 +216,27 @@ async fn fetch_desired_operations(config: &SqlConfig) -> Result<Vec<DesiredOpera
     }
 
     Ok(operations)
+}
+
+impl SqlConfig {
+    fn query_source(&self) -> &str {
+        if self.query_file.is_some() {
+            "query_file"
+        } else {
+            "query"
+        }
+    }
+
+    fn load_query(&self) -> Result<String> {
+        match (&self.query, &self.query_file) {
+            (Some(_), Some(_)) => bail!("mssql.query and mssql.query_file are mutually exclusive"),
+            (Some(query), None) => Ok(query.clone()),
+            (None, Some(path)) => {
+                fs::read_to_string(path).with_context(|| format!("read SQL query file {path}"))
+            }
+            (None, None) => bail!("one of mssql.query or mssql.query_file is required"),
+        }
+    }
 }
 
 fn operation_from_row(row: tiberius::Row) -> Result<DesiredOperation> {
