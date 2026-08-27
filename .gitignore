@@ -1,4 +1,5 @@
 /target
+/dist
 /.env
 /config.toml
 /workstations.toml
