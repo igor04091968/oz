@@ -3,7 +3,7 @@
 //! ОЗ — небольшой оркестратор заявок на удаленную работу.
 //!
 //! Программа имеет два сценария запуска:
-//! - CLI для планирования и применения операций pfSense;
+//! - CLI для проверки заявок;
 //! - GUI для настройки подключений, фонового опроса MSSQL и click-to-call.
 //!
 //! Секреты намеренно не записываются в TOML и не попадают в журнал. GUI хранит
@@ -21,7 +21,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use clap::{Args, Parser, Subcommand};
-use reqwest::{Client as HttpClient, Method};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -30,23 +29,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing::{info, warn};
-use url::Url;
 
 #[derive(Parser)]
-#[command(version, about = "Apply pfSense REST API desired state from MSSQL")]
+#[command(version, about = "Отслеживание заявок и XMPP/Miranda-интеграция")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-// Подкоманды разделены по уровню автоматизации: plan только читает данные,
-// run работает с общим desired-state запросом, process-requests обслуживает
-// заявки на удаленную работу, gui запускает настольный интерфейс.
+// Подкоманды разделены по назначению: process-requests проверяет заявки,
+// gui запускает настольный интерфейс.
 #[derive(Subcommand)]
 enum Command {
-    Plan(CommonArgs),
-    Run(RunArgs),
-    ProcessRequests(RunArgs),
+    ProcessRequests(CommonArgs),
     Gui,
 }
 
@@ -58,23 +53,6 @@ struct CommonArgs {
     config: String,
 }
 
-// --dry-run является безопасным режимом по умолчанию для ручной проверки.
-// Фактическое изменение pfSense разрешается только явным --apply.
-#[derive(Args, Clone)]
-struct RunArgs {
-    #[command(flatten)]
-    common: CommonArgs,
-
-    #[arg(long)]
-    once: bool,
-
-    #[arg(long, conflicts_with = "apply")]
-    dry_run: bool,
-
-    #[arg(long)]
-    apply: bool,
-}
-
 // Эти структуры описывают runtime-конфигурацию. Они не содержат паролей и
 // токенов: вместо них хранятся имена переменных окружения.
 #[derive(Debug, Deserialize)]
@@ -82,12 +60,12 @@ struct AppConfig {
     runtime: RuntimeConfig,
     mssql: SqlConfig,
     requests: Option<RequestsConfig>,
-    pfsense: PfsenseConfig,
 }
 
 #[derive(Debug, Deserialize)]
 struct RuntimeConfig {
-    interval_seconds: u64,
+    #[serde(rename = "interval_seconds")]
+    _interval_seconds: u64,
     audit_db_path: String,
 }
 
@@ -95,69 +73,18 @@ struct RuntimeConfig {
 struct SqlConfig {
     connection_string_env: String,
     default_connection_string: Option<String>,
-    query: Option<String>,
-    query_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RequestsConfig {
     query_file: String,
-    mapping_file: String,
-    rdp_port: u16,
     mark_unapproved_as_seen: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct PfsenseConfig {
-    base_url: String,
-    token_env: String,
-    insecure_tls: bool,
-    timeout_seconds: u64,
-    remote_work_access: Option<PfsenseOperationTemplate>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PfsenseOperationTemplate {
-    method: String,
-    path: String,
-    body_template: String,
-}
-
-// Нормализованная операция, которую можно повторно применить без дублей:
-// desired_hash используется аудитом как идемпотентный идентификатор состояния.
-#[derive(Debug, Clone)]
-struct DesiredOperation {
-    rule_key: String,
-    action: String,
-    method: String,
-    path: String,
-    body_json: Option<String>,
-    desired_hash: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkstationMappings {
-    employee: Vec<EmployeeAccess>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EmployeeAccess {
-    requester: String,
-    vpn_user: String,
-    workstation_host: String,
-    enabled: bool,
 }
 
 #[derive(Debug, Clone)]
 struct RemoteWorkRequest {
     request_num: String,
     requester: String,
-    date_z: String,
-    date_n: String,
-    time_n: String,
-    date_k: String,
-    time_k: String,
-    reason: String,
     por_neisp: i32,
 }
 
@@ -174,23 +101,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => run_gui(),
-        Some(Command::Plan(args)) => {
-            let config = load_config(&args.config)?;
-            print_plan(&config)
-        }
-        Some(Command::Run(args)) => {
-            let config = load_config(&args.common.config)?;
-            let apply = args.apply;
-
-            if !args.once {
-                run_loop(&config, apply).await
-            } else {
-                run_once(&config, apply).await
-            }
-        }
         Some(Command::ProcessRequests(args)) => {
-            let config = load_config(&args.common.config)?;
-            process_requests(&config, args.apply).await
+            let config = load_config(&args.config)?;
+            process_requests(&config).await
         }
         Some(Command::Gui) => run_gui(),
     }
@@ -198,7 +111,6 @@ async fn main() -> Result<()> {
 
 const GUI_SERVICE: &str = "oz";
 const MSSQL_SECRET: &str = "mssql-connection-string";
-const PFSENSE_SECRET: &str = "pfsense-api-token";
 const XMPP_SECRET: &str = "xmpp-account-password";
 
 // Настройки GUI сериализуются в gui-settings.toml. Поля с паролями отсутствуют:
@@ -213,8 +125,6 @@ struct GuiSettings {
     sql_port: String,
     sql_database: String,
     sql_user: String,
-    pfsense_url: String,
-    mapping_file: String,
     query_file: String,
     audit_db_path: String,
     xmpp_server: String,
@@ -236,8 +146,6 @@ impl Default for GuiSettings {
             sql_port: "1433".to_owned(),
             sql_database: "rd_all".to_owned(),
             sql_user: String::new(),
-            pfsense_url: "https://10.35.0.1:8443/api/v2".to_owned(),
-            mapping_file: "workstations.toml".to_owned(),
             query_file: "sql/remote_work_requests.sql".to_owned(),
             audit_db_path: "audit.sqlite3".to_owned(),
             xmpp_server: "jabber.syk.sevnb.ru".to_owned(),
@@ -254,10 +162,8 @@ impl Default for GuiSettings {
 struct GuiApp {
     settings: GuiSettings,
     mssql_password: String,
-    pfsense_token: String,
     xmpp_password: String,
     remember_secrets: bool,
-    apply: bool,
     status: String,
     running: bool,
     stop: Arc<AtomicBool>,
@@ -272,17 +178,14 @@ impl GuiApp {
     fn new() -> Self {
         let settings = load_gui_settings().unwrap_or_default();
         let mssql_password = read_secret(MSSQL_SECRET).unwrap_or_default();
-        let pfsense_token = read_secret(PFSENSE_SECRET).unwrap_or_default();
         let xmpp_password = read_secret(XMPP_SECRET).unwrap_or_default();
         let (result_tx, result_rx) = mpsc::channel();
         Self {
             settings,
             mssql_password,
-            pfsense_token,
             xmpp_password,
             remember_secrets: true,
-            apply: false,
-            status: "Готово. Режим dry-run включен.".to_owned(),
+            status: "Готово. Ожидание проверки заявок.".to_owned(),
             running: false,
             stop: Arc::new(AtomicBool::new(false)),
             result_rx,
@@ -297,16 +200,13 @@ impl GuiApp {
         self.stop = Arc::new(AtomicBool::new(false));
         let settings = self.settings.clone();
         let mssql_password = self.mssql_password.clone();
-        let pfsense_token = self.pfsense_token.clone();
         let xmpp_password = self.xmpp_password.clone();
-        let apply = self.apply;
         let remember_secrets = self.remember_secrets;
         if let Err(error) = save_gui_settings(&settings)
             .and_then(|_| write_runtime_config(&settings))
             .and_then(|_| {
                 if remember_secrets {
                     save_secret(MSSQL_SECRET, &mssql_password)?;
-                    save_secret(PFSENSE_SECRET, &pfsense_token)?;
                     save_secret(XMPP_SECRET, &xmpp_password)?;
                 }
                 Ok(())
@@ -320,13 +220,7 @@ impl GuiApp {
         let config_path = settings.config_path.clone();
         let stop = Arc::clone(&self.stop);
         self.running = true;
-        self.status = if settings.poll_enabled {
-            "Фоновый опрос запущен.".to_owned()
-        } else if apply {
-            "Выполняется APPLY...".to_owned()
-        } else {
-            "Выполняется dry-run...".to_owned()
-        };
+        self.status = "Фоновый опрос запущен.".to_owned();
         // Фоновый поток не блокирует egui. Результаты каждой проверки возвращаются
         // в GUI через канал, а stop-флаг позволяет корректно завершить поток.
         thread::spawn(move || {
@@ -339,9 +233,7 @@ impl GuiApp {
                     &settings,
                     &config_path,
                     &mssql_password,
-                    &pfsense_token,
                     &xmpp_password,
-                    apply,
                     &mut notified_fingerprint,
                 );
                 let _ = tx.send(message);
@@ -402,27 +294,19 @@ fn run_gui_poll(
     settings: &GuiSettings,
     config_path: &str,
     mssql_password: &str,
-    pfsense_token: &str,
     xmpp_password: &str,
-    apply: bool,
     notified_fingerprint: &mut String,
 ) -> String {
-    // GUI запускает тот же process-requests, что и CLI. Это исключает расхождение
-    // логики между ручным запуском и периодическим фоновым режимом.
+    // GUI запускает тот же process-requests, что и CLI, поэтому ручная проверка
+    // и фоновый опрос используют один и тот же код получения данных.
     let mut command = std::process::Command::new(
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("oz.exe")),
     );
-    command.args(["process-requests", "--config", config_path, "--once"]);
-    if apply {
-        command.arg("--apply");
-    } else {
-        command.arg("--dry-run");
-    }
+    command.args(["process-requests", "--config", config_path]);
     command.env(
         "MSSQL_CONNECTION_STRING",
         build_connection_string(settings, mssql_password),
     );
-    command.env("PFSENSE_API_TOKEN", pfsense_token);
 
     let output = match command.output() {
         Ok(output) => output,
@@ -693,16 +577,6 @@ impl eframe::App for GuiApp {
                     text_field(ui, "Пользователь", &mut self.settings.sql_user);
                     password_field(ui, "Пароль", &mut self.mssql_password);
                 });
-            eframe::egui::CollapsingHeader::new("pfSense REST API")
-                .default_open(true)
-                .show(ui, |ui| {
-                    text_field(ui, "URL API", &mut self.settings.pfsense_url);
-                    password_field(ui, "API token", &mut self.pfsense_token);
-                    ui.checkbox(
-                        &mut self.remember_secrets,
-                        "Хранить секреты в Credential Manager",
-                    );
-                });
             eframe::egui::CollapsingHeader::new("Фоновый опрос и Miranda/XMPP")
                 .default_open(true)
                 .show(ui, |ui| {
@@ -743,26 +617,18 @@ impl eframe::App for GuiApp {
                     }
                     ui.label("Уведомление отправляется один раз для каждого нового набора заявок.");
                 });
+            ui.checkbox(
+                &mut self.remember_secrets,
+                "Хранить пароли в Credential Manager",
+            );
             eframe::egui::CollapsingHeader::new("Файлы и параметры")
                 .default_open(true)
                 .show(ui, |ui| {
                     text_field(ui, "Конфигурация", &mut self.settings.config_path);
                     text_field(ui, "SQL запрос", &mut self.settings.query_file);
-                    text_field(
-                        ui,
-                        "Сопоставление сотрудников",
-                        &mut self.settings.mapping_file,
-                    );
                     text_field(ui, "Журнал SQLite", &mut self.settings.audit_db_path);
                 });
             ui.separator();
-            ui.checkbox(&mut self.apply, "Применять изменения в pfSense (APPLY)");
-            if self.apply {
-                ui.colored_label(
-                    eframe::egui::Color32::RED,
-                    "Внимание: будут изменены правила pfSense",
-                );
-            }
             if ui
                 .add_enabled(!self.running, eframe::egui::Button::new("Запустить опрос"))
                 .clicked()
@@ -847,7 +713,7 @@ fn build_connection_string(settings: &GuiSettings, password: &str) -> String {
 }
 
 // Генерируем минимальный runtime config для дочернего process-requests.
-// Пароль MSSQL и токен pfSense передаются ему только через environment.
+// Пароль MSSQL передается ему только через environment.
 fn write_runtime_config(settings: &GuiSettings) -> Result<()> {
     let interval_seconds = settings
         .poll_interval_seconds
@@ -866,20 +732,7 @@ query_file = "{}"
 
 [requests]
 query_file = {:?}
-mapping_file = {:?}
-rdp_port = {}
 mark_unapproved_as_seen = false
-
-[pfsense]
-base_url = {:?}
-token_env = "PFSENSE_API_TOKEN"
-insecure_tls = true
-timeout_seconds = 15
-
-[pfsense.remote_work_access]
-method = "POST"
-path = "/firewall/rule"
-body_template = "{{\"type\":\"pass\",\"interface\":\"openvpn\",\"ipprotocol\":\"inet\",\"protocol\":\"tcp\",\"source\":\"{{{{vpn_user}}}}\",\"destination\":\"{{{{workstation_host}}}}\",\"destination_port\":\"{{{{rdp_port}}}}\",\"descr\":\"remote-work {{{{request_num}}}} {{{{requester}}}} {{{{date_n}}}} {{{{time_n}}}}\"}}"
 "#,
         interval_seconds,
         settings.audit_db_path,
@@ -887,10 +740,7 @@ body_template = "{{\"type\":\"pass\",\"interface\":\"openvpn\",\"ipprotocol\":\"
         settings.sql_port,
         settings.sql_database,
         settings.query_file,
-        settings.query_file,
-        settings.mapping_file,
-        3389,
-        settings.pfsense_url
+        settings.query_file
     );
     fs::write(&settings.config_path, config)
         .with_context(|| format!("write {}", settings.config_path))
@@ -919,42 +769,15 @@ fn load_config(path: &str) -> Result<AppConfig> {
     toml::from_str(&raw).with_context(|| format!("parse config {path}"))
 }
 
-fn print_plan(config: &AppConfig) -> Result<()> {
-    let base = Url::parse(&config.pfsense.base_url).context("parse pfsense.base_url")?;
-
-    println!(
-        "MSSQL connection env: {}",
-        config.mssql.connection_string_env
-    );
-    println!("pfSense API: {}", base);
-    println!("Audit DB: {}", config.runtime.audit_db_path);
-    println!("Interval: {}s", config.runtime.interval_seconds);
-    println!("pfSense token env: {}", config.pfsense.token_env);
-    println!("SQL query source: {}", config.mssql.query_source());
-    if let Some(requests) = &config.requests {
-        println!("Requests query file: {}", requests.query_file);
-        println!("Workstation mapping file: {}", requests.mapping_file);
-        println!("RDP port: {}", requests.rdp_port);
-    }
-
-    Ok(())
-}
-
-// Обработка заявок идет в строгом порядке: получить данные, отфильтровать уже
-// обработанные, проверить согласование, найти рабочую станцию и только затем
-// при --apply изменить pfSense. В dry-run выполняется тот же расчет без записи.
-async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
+// Обработка заявок получает свежие данные, исключает уже просмотренные записи
+// и сообщает о состоянии согласования. Изменение внешних систем временно не
+// выполняется: этот режим оставляет заявки доступными для дальнейшей обработки.
+async fn process_requests(config: &AppConfig) -> Result<()> {
     let requests_config = config
         .requests
         .as_ref()
         .context("requests section is required for process-requests")?;
-    let mappings = load_workstation_mappings(&requests_config.mapping_file)?;
     let audit = Audit::open(&config.runtime.audit_db_path)?;
-    let pfsense = if apply {
-        Some(PfsenseClient::new(&config.pfsense)?)
-    } else {
-        None
-    };
     let query = fs::read_to_string(&requests_config.query_file)
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
@@ -976,7 +799,7 @@ async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
         "OZ_RESULT fetched={} pending={} fingerprint={}",
         requests.len(),
         pending_requests.len(),
-        hash_operation("PENDING", "remote-work", Some(&pending_fingerprint))
+        hash_pending_requests(&pending_fingerprint)
     );
 
     for request in requests {
@@ -1003,153 +826,14 @@ async fn process_requests(config: &AppConfig, apply: bool) -> Result<()> {
             continue;
         }
 
-        // Сопоставление выполняется по имени заявителя из MSSQL. Неактивные
-        // записи mapping-файла никогда не получают доступ.
-        let Some(employee) = mappings.employee.iter().find(|item| {
-            item.enabled
-                && item
-                    .requester
-                    .eq_ignore_ascii_case(request.requester.trim())
-        }) else {
-            warn!(
-                request_num = request.request_num,
-                requester = request.requester,
-                "no enabled workstation mapping for requester"
-            );
-            continue;
-        };
-
-        let op = remote_work_operation(config, requests_config, &request, employee)?;
-
-        if audit.is_applied(&op.rule_key, &op.desired_hash)? {
-            audit.record_request_processed(&request, &op, "already_applied")?;
-            continue;
-        }
-
-        if !apply {
-            warn!(
-                request_num = request.request_num,
-                requester = request.requester,
-                vpn_user = employee.vpn_user,
-                workstation_host = employee.workstation_host,
-                "dry run: would grant OpenVPN RDP access"
-            );
-            continue;
-        }
-
-        pfsense
-            .as_ref()
-            .context("pfSense client is required when --apply is used")?
-            .apply(&op)
-            .await?;
-        audit.record_applied(&op)?;
-        audit.record_request_processed(&request, &op, "applied")?;
         info!(
             request_num = request.request_num,
             requester = request.requester,
-            vpn_user = employee.vpn_user,
-            workstation_host = employee.workstation_host,
-            "remote access granted"
+            "approved request is ready for operator processing"
         );
     }
 
     Ok(())
-}
-
-async fn run_loop(config: &AppConfig, apply: bool) -> Result<()> {
-    // CLI-цикл предназначен для длительного запуска как служба. Остановка по
-    // Ctrl+C обрабатывается без изменения состояния pfSense.
-    loop {
-        run_once(config, apply).await?;
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(config.runtime.interval_seconds)) => {}
-            _ = tokio::signal::ctrl_c() => {
-                info!("shutdown signal received");
-                return Ok(());
-            }
-        }
-    }
-}
-
-async fn run_once(config: &AppConfig, apply: bool) -> Result<()> {
-    let audit = Audit::open(&config.runtime.audit_db_path)?;
-    let operations = fetch_desired_operations(&config.mssql).await?;
-    let pfsense = if apply {
-        Some(PfsenseClient::new(&config.pfsense)?)
-    } else {
-        None
-    };
-
-    for op in operations {
-        if audit.is_applied(&op.rule_key, &op.desired_hash)? {
-            info!(
-                rule_key = op.rule_key,
-                action = op.action,
-                "operation already applied"
-            );
-            continue;
-        }
-
-        if !apply {
-            warn!(
-                rule_key = op.rule_key,
-                action = op.action,
-                method = op.method,
-                path = op.path,
-                desired_hash = op.desired_hash,
-                "dry run: would apply operation"
-            );
-            continue;
-        }
-
-        pfsense
-            .as_ref()
-            .context("pfSense client is required when --apply is used")?
-            .apply(&op)
-            .await?;
-        audit.record_applied(&op)?;
-        info!(
-            rule_key = op.rule_key,
-            action = op.action,
-            "operation applied"
-        );
-    }
-
-    Ok(())
-}
-
-async fn fetch_desired_operations(config: &SqlConfig) -> Result<Vec<DesiredOperation>> {
-    // Общий desired-state путь получает строки из MSSQL и превращает каждую
-    // строку в нормализованную REST-операцию.
-    let connection_string = config.connection_string()?;
-    let mssql = MssqlConfig::from_ado_string(&connection_string)
-        .with_context(|| format!("parse {}", config.connection_string_env))?;
-
-    let tcp = TcpStream::connect(mssql.get_addr())
-        .await
-        .context("connect MSSQL")?;
-    tcp.set_nodelay(true).context("set MSSQL TCP_NODELAY")?;
-
-    let mut client = MssqlClient::connect(mssql, tcp.compat_write())
-        .await
-        .context("login MSSQL")?;
-
-    let rows = client
-        .simple_query(config.load_query()?.as_str())
-        .await
-        .context("execute MSSQL desired-state query")?
-        .into_results()
-        .await
-        .context("read MSSQL rows")?;
-
-    let mut operations = Vec::new();
-    for result_set in rows {
-        for row in result_set {
-            operations.push(operation_from_row(row)?);
-        }
-    }
-
-    Ok(operations)
 }
 
 async fn fetch_remote_work_requests(
@@ -1201,137 +885,13 @@ impl SqlConfig {
                 .with_context(|| format!("{} is required", self.connection_string_env)),
         }
     }
-
-    fn query_source(&self) -> &str {
-        if self.query_file.is_some() {
-            "query_file"
-        } else {
-            "query"
-        }
-    }
-
-    fn load_query(&self) -> Result<String> {
-        match (&self.query, &self.query_file) {
-            (Some(_), Some(_)) => bail!("mssql.query and mssql.query_file are mutually exclusive"),
-            (Some(query), None) => Ok(query.clone()),
-            (None, Some(path)) => {
-                fs::read_to_string(path).with_context(|| format!("read SQL query file {path}"))
-            }
-            (None, None) => bail!("one of mssql.query or mssql.query_file is required"),
-        }
-    }
-}
-
-fn load_workstation_mappings(path: &str) -> Result<WorkstationMappings> {
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("read workstation mapping {path}"))?;
-    toml::from_str(&raw).with_context(|| format!("parse workstation mapping {path}"))
 }
 
 fn remote_work_request_from_row(row: tiberius::Row) -> Result<RemoteWorkRequest> {
     Ok(RemoteWorkRequest {
         request_num: get_required_str(&row, "num1")?,
         requester: get_required_str(&row, "ot_kogo")?,
-        date_z: get_optional_str(&row, "date_z").unwrap_or_default(),
-        date_n: get_optional_str(&row, "date_n").unwrap_or_default(),
-        time_n: get_optional_str(&row, "time_n").unwrap_or_default(),
-        date_k: get_optional_str(&row, "date_k").unwrap_or_default(),
-        time_k: get_optional_str(&row, "time_k").unwrap_or_default(),
-        reason: get_optional_str(&row, "prich").unwrap_or_default(),
         por_neisp: row.get::<i32, _>("por_neisp").unwrap_or(1),
-    })
-}
-
-fn remote_work_operation(
-    config: &AppConfig,
-    requests_config: &RequestsConfig,
-    request: &RemoteWorkRequest,
-    employee: &EmployeeAccess,
-) -> Result<DesiredOperation> {
-    // Тело REST-запроса строится из проверенной заявки и разрешенной записи
-    // workstation mapping, а не из произвольного пользовательского JSON.
-    let template = config
-        .pfsense
-        .remote_work_access
-        .as_ref()
-        .context("pfsense.remote_work_access section is required")?;
-    let body_json = render_remote_work_template(
-        &template.body_template,
-        request,
-        employee,
-        requests_config.rdp_port,
-    );
-    let rule_key = format!("remote-work:{}:{}", request.request_num, employee.vpn_user);
-    let action = "grant_openvpn_rdp".to_owned();
-    let method = template.method.to_uppercase();
-    let path = template.path.clone();
-    let desired_hash = hash_operation(&method, &path, Some(&body_json));
-
-    Ok(DesiredOperation {
-        rule_key,
-        action,
-        method,
-        path,
-        body_json: Some(body_json),
-        desired_hash,
-    })
-}
-
-fn render_remote_work_template(
-    template: &str,
-    request: &RemoteWorkRequest,
-    employee: &EmployeeAccess,
-    rdp_port: u16,
-) -> String {
-    // Подставляем значения с JSON-экранированием: шаблон остается JSON, а
-    // кавычки и спецсимволы в ФИО/причине не ломают тело запроса.
-    let mut rendered = template.to_owned();
-    let replacements = [
-        ("request_num", request.request_num.as_str()),
-        ("requester", request.requester.as_str()),
-        ("vpn_user", employee.vpn_user.as_str()),
-        ("workstation_host", employee.workstation_host.as_str()),
-        ("date_z", request.date_z.as_str()),
-        ("date_n", request.date_n.as_str()),
-        ("time_n", request.time_n.as_str()),
-        ("date_k", request.date_k.as_str()),
-        ("time_k", request.time_k.as_str()),
-        ("reason", request.reason.as_str()),
-    ];
-
-    for (key, value) in replacements {
-        rendered = rendered.replace(&format!("{{{{{key}}}}}"), &json_escape(value));
-    }
-    rendered.replace("{{rdp_port}}", &rdp_port.to_string())
-}
-
-fn json_escape(value: &str) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "\"\"".to_owned())
-        .trim_matches('"')
-        .to_owned()
-}
-
-fn operation_from_row(row: tiberius::Row) -> Result<DesiredOperation> {
-    let rule_key = get_required_str(&row, "rule_key")?;
-    let action = get_required_str(&row, "action")?;
-    let method = get_required_str(&row, "method")?.to_uppercase();
-    let path = get_required_str(&row, "path")?;
-    let body_json = get_optional_str(&row, "body_json");
-    let desired_hash = get_optional_str(&row, "desired_hash")
-        .unwrap_or_else(|| hash_operation(&method, &path, body_json.as_deref()));
-
-    if !path.starts_with('/') {
-        bail!("path for {rule_key} must start with /");
-    }
-
-    Ok(DesiredOperation {
-        rule_key,
-        action,
-        method,
-        path,
-        body_json,
-        desired_hash,
     })
 }
 
@@ -1344,89 +904,11 @@ fn get_optional_str(row: &tiberius::Row, name: &str) -> Option<String> {
     row.get::<&str, _>(name).map(str::to_owned)
 }
 
-fn hash_operation(method: &str, path: &str, body_json: Option<&str>) -> String {
-    // Хэш учитывает весь desired state. Изменение метода, URL или тела создает
-    // новую версию операции и не маскируется старой записью аудита.
+fn hash_pending_requests(request_numbers: &str) -> String {
+    // Отпечаток списка нужен GUI только для подавления повторных уведомлений.
     let mut hasher = Sha256::new();
-    hasher.update(method.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(path.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(body_json.unwrap_or("").as_bytes());
+    hasher.update(request_numbers.as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-struct PfsenseClient {
-    http: HttpClient,
-    base_url: Url,
-    token: String,
-}
-
-impl PfsenseClient {
-    // Клиент создается только в APPLY-режиме. В dry-run токен не требуется,
-    // благодаря чему можно безопасно проверить MSSQL и сформированный план.
-    fn new(config: &PfsenseConfig) -> Result<Self> {
-        let token = std::env::var(&config.token_env)
-            .with_context(|| format!("{} is required", config.token_env))?;
-
-        let http = HttpClient::builder()
-            .timeout(Duration::from_secs(config.timeout_seconds))
-            .danger_accept_invalid_certs(config.insecure_tls)
-            .build()
-            .context("build HTTP client")?;
-
-        Ok(Self {
-            http,
-            base_url: parse_base_url(&config.base_url)?,
-            token,
-        })
-    }
-
-    async fn apply(&self, op: &DesiredOperation) -> Result<()> {
-        // URL строится только из базового API URL и path операции. Перед отправкой
-        // тело разбирается как JSON, поэтому некорректный шаблон отбрасывается.
-        let method = Method::from_bytes(op.method.as_bytes())
-            .with_context(|| format!("invalid HTTP method {}", op.method))?;
-        let url = self
-            .base_url
-            .join(op.path.trim_start_matches('/'))
-            .with_context(|| format!("join pfSense path {}", op.path))?;
-
-        let mut request = self.http.request(method, url).bearer_auth(&self.token);
-
-        if let Some(body) = &op.body_json {
-            let value: serde_json::Value = serde_json::from_str(body)
-                .with_context(|| format!("body_json is invalid for {}", op.rule_key))?;
-            request = request.json(&value);
-        }
-
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("send pfSense request for {}", op.rule_key))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!(
-                "pfSense request failed for {}: {} {}",
-                op.rule_key,
-                status,
-                body
-            );
-        }
-
-        Ok(())
-    }
-}
-
-fn parse_base_url(raw: &str) -> Result<Url> {
-    let normalized = if raw.ends_with('/') {
-        raw.to_owned()
-    } else {
-        format!("{raw}/")
-    };
-    Url::parse(&normalized).context("parse pfsense.base_url")
 }
 
 struct Audit {
@@ -1435,18 +917,11 @@ struct Audit {
 
 impl Audit {
     // SQLite-аудит делает повторные запуски идемпотентными и сохраняет историю
-    // как примененных REST-операций, так и обработанных заявок.
+    // уже просмотренных заявок.
     fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open audit DB {path}"))?;
         conn.execute_batch(
-            "create table if not exists applied_operations (
-                rule_key text not null,
-                desired_hash text not null,
-                action text not null,
-                applied_at text not null default current_timestamp,
-                primary key (rule_key, desired_hash)
-            );
-            create table if not exists processed_requests (
+            "create table if not exists processed_requests (
                 request_num text primary key,
                 requester text not null,
                 rule_key text,
@@ -1458,23 +933,6 @@ impl Audit {
         Ok(Self { conn })
     }
 
-    fn is_applied(&self, rule_key: &str, desired_hash: &str) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "select count(*) from applied_operations where rule_key = ?1 and desired_hash = ?2",
-            params![rule_key, desired_hash],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
-    fn record_applied(&self, op: &DesiredOperation) -> Result<()> {
-        self.conn.execute(
-            "insert or ignore into applied_operations (rule_key, desired_hash, action) values (?1, ?2, ?3)",
-            params![op.rule_key, op.desired_hash, op.action],
-        )?;
-        Ok(())
-    }
-
     fn is_request_processed(&self, request_num: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "select count(*) from processed_requests where request_num = ?1",
@@ -1482,19 +940,6 @@ impl Audit {
             |row| row.get(0),
         )?;
         Ok(count > 0)
-    }
-
-    fn record_request_processed(
-        &self,
-        request: &RemoteWorkRequest,
-        op: &DesiredOperation,
-        status: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            "insert or replace into processed_requests (request_num, requester, rule_key, status) values (?1, ?2, ?3, ?4)",
-            params![request.request_num, request.requester, op.rule_key, status],
-        )?;
-        Ok(())
     }
 
     fn record_request_skipped(&self, request: &RemoteWorkRequest, status: &str) -> Result<()> {
@@ -1511,55 +956,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pfsense_base_url_preserves_api_prefix() {
-        let base = parse_base_url("https://pfsense.example.local/api/v2").unwrap();
-        let url = base.join("firewall/rule").unwrap();
-
-        assert_eq!(
-            url.as_str(),
-            "https://pfsense.example.local/api/v2/firewall/rule"
-        );
-    }
-
-    #[test]
-    fn operation_hash_is_stable() {
-        let left = hash_operation("POST", "/firewall/rule", Some("{\"a\":1}"));
-        let right = hash_operation("POST", "/firewall/rule", Some("{\"a\":1}"));
+    fn pending_hash_is_stable() {
+        let left = hash_pending_requests("42\n43");
+        let right = hash_pending_requests("42\n43");
 
         assert_eq!(left, right);
-    }
-
-    #[test]
-    fn remote_work_template_renders_request_context() {
-        let request = RemoteWorkRequest {
-            request_num: "42".to_owned(),
-            requester: "Ivanov".to_owned(),
-            date_z: "2026-08-27".to_owned(),
-            date_n: "2026-08-28".to_owned(),
-            time_n: "09:00-18:00".to_owned(),
-            date_k: String::new(),
-            time_k: String::new(),
-            reason: "test".to_owned(),
-            por_neisp: 0,
-        };
-        let employee = EmployeeAccess {
-            requester: "Ivanov".to_owned(),
-            vpn_user: "ivanov_i".to_owned(),
-            workstation_host: "10.32.5.121".to_owned(),
-            enabled: true,
-        };
-
-        let rendered = render_remote_work_template(
-            r#"{"source":"{{vpn_user}}","destination":"{{workstation_host}}","port":{{rdp_port}},"descr":"{{request_num}} {{date_n}}"}"#,
-            &request,
-            &employee,
-            3389,
-        );
-
-        assert_eq!(
-            rendered,
-            r#"{"source":"ivanov_i","destination":"10.32.5.121","port":3389,"descr":"42 2026-08-28"}"#
-        );
     }
 
     #[test]
@@ -1594,6 +995,5 @@ mod tests {
             "MSSQL_CONNECTION_STRING"
         );
         assert!(!raw.contains("password"));
-        assert!(!raw.contains(PFSENSE_SECRET));
     }
 }

@@ -1,7 +1,7 @@
 param(
-    [string]$InstallDir = "C:\Program Files\PfsenseMssqlOrchestrator",
-    [string]$ConfigPath = "C:\ProgramData\PfsenseMssqlOrchestrator\config.toml",
-    [string]$ServiceName = "PfsenseMssqlOrchestrator"
+    [string]$InstallDir = "C:\Program Files\OZ",
+    [string]$ConfigPath = "C:\ProgramData\OZ\config.toml",
+    [string]$ServiceName = "OZ"
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,12 +20,11 @@ if (-not (Test-Path $ConfigPath)) {
     throw "Config not found: $ConfigPath"
 }
 
-nssm install $ServiceName $ExePath run --config $ConfigPath
+nssm install $ServiceName $ExePath process-requests --config $ConfigPath
 nssm set $ServiceName AppDirectory $InstallDir
 nssm set $ServiceName AppStopMethodConsole 15000
 nssm set $ServiceName Start SERVICE_DEMAND_START
 
 Write-Host "Installed $ServiceName. Set machine environment variables before starting:"
 Write-Host "  MSSQL_CONNECTION_STRING"
-Write-Host "  PFSENSE_API_TOKEN"
 Write-Host "Then run: nssm start $ServiceName"

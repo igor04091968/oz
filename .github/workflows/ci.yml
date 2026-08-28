@@ -29,5 +29,5 @@ jobs:
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
-          name: pfsense-mssql-orchestrator-windows-x86_64
-          path: target/release/pfsense-mssql-orchestrator.exe
+          name: oz-windows-x86_64
+          path: target/release/oz.exe
