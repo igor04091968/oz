@@ -45,7 +45,8 @@ capture() {
 redact() {
     # Удаляем значения типовых секретов перед сохранением отчета. Это не
     # замена Presidio, а локальный fail-safe для автономного запуска на сервере.
-    sed -E \
+    # GNU sed из CentOS 5 поддерживает расширенные выражения через -r.
+    sed -r \
         -e 's/((password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|authorization|credential)[[:space:]]*[=:][[:space:]]*)[^[:space:];,]+/\1[REDACTED]/Ig' \
         -e 's/(Bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/Ig' \
         -e 's/(Basic[[:space:]]+)[^[:space:]]+/\1[REDACTED]/Ig' \
