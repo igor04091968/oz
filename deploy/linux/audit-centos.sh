@@ -10,6 +10,7 @@ HOSTNAME_VALUE="$(hostname -s 2>/dev/null || echo unknown)"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="${1:-./centos-audit-${HOSTNAME_VALUE}-${STAMP}}"
 ARCHIVE="${OUT_DIR}.tar.gz"
+KERNEL_RELEASE="$(uname -r 2>/dev/null || echo unknown)"
 
 mkdir -p "$OUT_DIR" || {
     printf 'Не удалось создать каталог: %s\n' "$OUT_DIR" >&2
@@ -52,17 +53,40 @@ redact() {
 }
 
 say "Метаданные ОС и ядра"
-capture 00-os-release.txt bash -c 'cat /etc/centos-release /etc/redhat-release 2>/dev/null; uname -a; printf "\\ncmdline: "; cat /proc/cmdline; printf "\\narch: "; uname -m'
-capture 01-hostname.txt hostnamectl
+printf 'Ожидаемое ядро: 2.6.18-194.26.1.el5xen\nФактическое ядро: %s\n' "$KERNEL_RELEASE"
+if [ "$KERNEL_RELEASE" != "2.6.18-194.26.1.el5xen" ]; then
+    printf 'ПРЕДУПРЕЖДЕНИЕ: версия ядра отличается от указанной оператором.\n'
+fi
+capture 00-os-release.txt bash -c 'cat /etc/centos-release /etc/redhat-release 2>/dev/null; uname -a; printf "\\ncmdline: "; cat /proc/cmdline; printf "\\narch: "; uname -m; printf "\\nvirtualization: "; cat /proc/sys/kernel/hostname 2>/dev/null'
+if have hostnamectl; then
+    capture 01-hostname.txt hostnamectl
+else
+    capture 01-hostname.txt bash -c 'hostname; cat /etc/sysconfig/network 2>/dev/null'
+fi
 capture 02-uptime.txt uptime
-capture 03-timezone.txt timedatectl
+if have timedatectl; then
+    capture 03-timezone.txt timedatectl
+else
+    capture 03-timezone.txt bash -c 'date; ls -l /etc/localtime; cat /etc/sysconfig/clock 2>/dev/null'
+fi
 
 say "Сеть и firewall"
-capture 10-addresses.txt ip -brief address
-capture 11-routes.txt ip route show table all
-capture 12-rules.txt ip rule show
-capture 13-listening.txt ss -lntup
-capture 14-neighbors.txt ip neigh show
+if have ip; then
+    capture 10-addresses.txt ip addr show
+    capture 11-routes.txt ip route show table all
+    capture 12-rules.txt ip rule show
+    capture 14-neighbors.txt ip neigh show
+else
+    capture 10-addresses.txt ifconfig -a
+    capture 11-routes.txt route -n
+fi
+if have ss; then
+    capture 13-listening.txt ss -lntup
+elif have netstat; then
+    capture 13-listening.txt netstat -lntup
+else
+    capture 13-listening.txt bash -c 'cat /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6'
+fi
 capture 15-resolver.txt bash -c 'cat /etc/resolv.conf; printf "\\n--- hosts ---\\n"; cat /etc/hosts'
 if have firewall-cmd; then
     capture 16-firewalld.txt firewall-cmd --list-all-zones
@@ -77,12 +101,17 @@ if have nft; then
     capture 19-nftables.txt nft list ruleset
 fi
 
-say "Активные сервисы systemd"
-capture 20-running-services.txt systemctl list-units --type=service --state=running --no-pager --plain
-capture 21-failed-services.txt systemctl list-units --state=failed --no-pager --plain
-capture 22-enabled-services.txt systemctl list-unit-files --type=service --state=enabled --no-pager --plain
-capture 23-timers.txt systemctl list-timers --all --no-pager --plain
-capture 24-sockets.txt systemctl list-sockets --all --no-pager --plain
+say "Активные сервисы SysV и systemd"
+if have systemctl; then
+    capture 20-running-services.txt systemctl list-units --type=service --state=running --no-pager --plain
+    capture 21-failed-services.txt systemctl list-units --state=failed --no-pager --plain
+    capture 22-enabled-services.txt systemctl list-unit-files --type=service --state=enabled --no-pager --plain
+    capture 23-timers.txt systemctl list-timers --all --no-pager --plain
+    capture 24-sockets.txt systemctl list-sockets --all --no-pager --plain
+else
+    printf '# CentOS 5 / legacy SysV init\n' >"$OUT_DIR/20-running-services.txt"
+    printf '# systemd отсутствует\n' >"$OUT_DIR/21-failed-services.txt"
+fi
 if have service; then
     capture 25-sysv-services.txt service --status-all
 fi
@@ -109,9 +138,18 @@ if have systemctl; then
 fi
 
 say "Процессы, cron и журналы запуска"
-capture 30-processes.txt ps -eo user,pid,ppid,stat,lstart,etime,comm,args --forest
-capture 31-cron.txt bash -c 'for f in /etc/crontab /etc/anacrontab; do [ -f "$f" ] && { echo "--- $f"; cat "$f"; }; done; find /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly -maxdepth 1 -type f -print 2>/dev/null'
-capture 32-mounts.txt findmnt -a
+if ps -eo pid >/dev/null 2>&1; then
+    capture 30-processes.txt ps -eo user,pid,ppid,stat,lstart,etime,comm,args
+else
+    capture 30-processes.txt ps auxww
+fi
+capture 31-cron.txt bash -c 'for f in /etc/crontab /etc/anacrontab; do [ -f "$f" ] && { echo "--- $f"; cat "$f"; }; done; for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do [ -d "$d" ] && { echo "--- $d"; ls -la "$d"; }; done'
+capture 34-xinetd.txt bash -c 'if [ -d /etc/xinetd.d ]; then ls -la /etc/xinetd.d; for f in /etc/xinetd.d/*; do [ -f "$f" ] && { echo "--- $f"; cat "$f"; }; done; fi'
+if have findmnt; then
+    capture 32-mounts.txt findmnt -a
+else
+    capture 32-mounts.txt mount
+fi
 capture 33-fstab.txt cat /etc/fstab
 
 say "Ядерные настройки"
@@ -125,6 +163,10 @@ if have grubby; then
     capture 47-grubby.txt grubby --info=ALL
 fi
 capture 46-security.txt bash -c 'getenforce 2>/dev/null || true; sestatus 2>/dev/null || true; aa-status 2>/dev/null || true'
+
+say "Xen и параметры загрузки"
+capture 48-xen.txt bash -c 'if [ -d /proc/xen ]; then echo "--- /proc/xen ---"; find /proc/xen -maxdepth 2 -type f -print -exec cat {} \\; 2>/dev/null; fi; if command -v xm >/dev/null 2>&1; then echo "--- xm info ---"; xm info; echo "--- xm list ---"; xm list; fi; if command -v xl >/dev/null 2>&1; then echo "--- xl info ---"; xl info; echo "--- xl list ---"; xl list; fi'
+capture 49-sysconfig.txt bash -c 'for f in /etc/sysconfig/network /etc/sysconfig/network-scripts/ifcfg-* /etc/sysconfig/modules/*.modules /etc/sysconfig/iptables /etc/sysconfig/selinux /etc/sysconfig/xendomains /etc/sysconfig/xen; do [ -f "$f" ] && { echo "--- $f"; cat "$f"; }; done'
 
 say "Поддержка контейнеров и виртуализации"
 if have docker; then capture 50-docker.txt docker ps --all --no-trunc; fi
