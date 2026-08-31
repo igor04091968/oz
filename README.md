@@ -21,6 +21,13 @@
 Он должен возвращать поля `num1`, `ot_kogo`, `date_z`, `date_n`, `time_n`,
 `date_k`, `time_k`, `prich` и `por_neisp`.
 
+## Сопутствующая эксплуатационная документация
+
+Поэтапное ТЗ для нового развертывания прокси-сервера закрытого контура Банка
+с CentOS на Debian находится в
+[docs/TZ_CLOSED_CONTOUR_PROXY_CENTOS_TO_DEBIAN.md](docs/TZ_CLOSED_CONTOUR_PROXY_CENTOS_TO_DEBIAN.md).
+Документ не относится к узлам `vds3`, `gw`, `gw2` и не содержит секретов.
+
 Ожидаемая рабочая база:
 
 ```text
