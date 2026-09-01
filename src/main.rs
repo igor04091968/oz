@@ -152,6 +152,7 @@ struct GuiSettings {
     xmpp_server: String,
     xmpp_port: String,
     xmpp_account: String,
+    xmpp_resource: String,
     xmpp_recipient: String,
     xmpp_call_recipient: String,
     xmpp_caller_extension: String,
@@ -175,9 +176,10 @@ impl Default for GuiSettings {
             xmpp_server: "jabber.syk.sevnb.ru".to_owned(),
             xmpp_port: "5222".to_owned(),
             xmpp_account: "oz@dns.sevnb.ru".to_owned(),
+            xmpp_resource: "WS-GST02".to_owned(),
             xmpp_recipient: String::new(),
             xmpp_call_recipient: "pbx@dns.sevnb.ru".to_owned(),
-            xmpp_caller_extension: "1000".to_owned(),
+            xmpp_caller_extension: "132".to_owned(),
             call_target: String::new(),
             report_date: "2026-09-01".to_owned(),
             report_period: "day".to_owned(),
@@ -291,6 +293,7 @@ impl GuiApp {
         let server = self.settings.xmpp_server.clone();
         let port = self.settings.xmpp_port.clone();
         let account = self.settings.xmpp_account.clone();
+        let resource = self.settings.xmpp_resource.clone();
         let password = self.xmpp_password.clone();
         let recipient = self.settings.xmpp_call_recipient.clone();
         let tx = self.result_tx.clone();
@@ -298,11 +301,15 @@ impl GuiApp {
         // Сетевой XMPP-сеанс выполняется вне потока интерфейса, иначе задержка
         // соединения или авторизации временно заморозит окно.
         thread::spawn(move || {
-            let result =
-                send_xmpp_call_blocking(&server, &port, &account, &password, &recipient, &target);
+            let result = send_xmpp_call_blocking(
+                &server, &port, &account, &resource, &password, &recipient, &target,
+            );
             let message = match result {
                 Ok(()) => {
-                    format!("OZ_FOCUS\nКоманда звонка отправлена на {target} от номера 1000.")
+                    format!(
+                        "OZ_FOCUS\nКоманда звонка отправлена на {target} от источника {}.",
+                        resource
+                    )
                 }
                 Err(error) => format!("Звонок не отправлен: {error}"),
             };
@@ -319,6 +326,7 @@ impl GuiApp {
         let server = self.settings.xmpp_server.clone();
         let port = self.settings.xmpp_port.clone();
         let account = self.settings.xmpp_account.clone();
+        let resource = self.settings.xmpp_resource.clone();
         let password = self.xmpp_password.clone();
         let tx = self.result_tx.clone();
         self.status = format!("Тест XMPP: отправка сообщения на {recipient}...");
@@ -327,6 +335,7 @@ impl GuiApp {
                 &server,
                 &port,
                 &account,
+                &resource,
                 &password,
                 &recipient,
                 "ОЗ: тестовое сообщение XMPP, ответ не требуется.",
@@ -455,11 +464,12 @@ fn run_gui_poll(
                         let server = settings.xmpp_server.clone();
                         let port = settings.xmpp_port.clone();
                         let account = settings.xmpp_account.clone();
+                        let resource = settings.xmpp_resource.clone();
                         let recipient = settings.xmpp_recipient.clone();
                         let password = xmpp_password.to_owned();
                         move || {
                             send_xmpp_message_blocking(
-                                &server, &port, &account, &password, &recipient, &body,
+                                &server, &port, &account, &resource, &password, &recipient, &body,
                             )
                         }
                     })
@@ -510,6 +520,7 @@ fn send_xmpp_message_blocking(
     server: &str,
     port: &str,
     account: &str,
+    resource: &str,
     password: &str,
     recipient: &str,
     body: &str,
@@ -521,17 +532,18 @@ fn send_xmpp_message_blocking(
         .map_err(|error| error.to_string())?;
     runtime
         .block_on(send_xmpp_message(
-            server, port, account, password, recipient, body,
+            server, port, account, resource, password, recipient, body,
         ))
         .map_err(|error| format!("{error:#}"))
 }
 
 // ATS ожидает обычное Miranda-сообщение "Позвонить <цель>" на JID pbx.
-// Номер-источник определяется на АТС по JID учетной записи OZ через sippeers.
+// Номер-источник определяется на АТС по XMPP-ресурсу рабочей станции через sippeers.
 fn send_xmpp_call_blocking(
     server: &str,
     port: &str,
     account: &str,
+    resource: &str,
     password: &str,
     recipient: &str,
     target: &str,
@@ -546,6 +558,7 @@ fn send_xmpp_call_blocking(
             server,
             port,
             account,
+            resource,
             password,
             recipient,
             &format!("Позвонить {target}"),
@@ -569,6 +582,7 @@ async fn send_xmpp_message(
     server: &str,
     port: &str,
     account: &str,
+    resource: &str,
     password: &str,
     recipient: &str,
     body: &str,
@@ -580,6 +594,7 @@ async fn send_xmpp_message(
         .split_once('@')
         .context("XMPP account must be a full JID")?;
     let port: u16 = port.parse().context("invalid XMPP port")?;
+    validate_xmpp_resource(resource)?;
     let mut stream = TcpStream::connect((server, port))
         .await
         .with_context(|| format!("connect XMPP {server}:{port}"))?;
@@ -603,7 +618,15 @@ async fn send_xmpp_message(
     read_xmpp_until(&mut stream, "<success", "XMPP authentication").await?;
     stream.write_all(stream_open.as_bytes()).await?;
     read_xmpp_until(&mut stream, "<stream:features", "XMPP bind features").await?;
-    stream.write_all(b"<iq id='oz-bind-1' type='set'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>oz</resource></bind></iq>").await?;
+    let resource = xml_escape(resource);
+    stream
+        .write_all(
+            format!(
+                "<iq id='oz-bind-1' type='set'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>{resource}</resource></bind></iq>"
+            )
+            .as_bytes(),
+        )
+        .await?;
     read_xmpp_until(&mut stream, "oz-bind-1", "XMPP resource binding").await?;
     let id = xml_escape(&format!("oz-{}", std::process::id()));
     let recipient = xml_escape(recipient);
@@ -617,6 +640,19 @@ async fn send_xmpp_message(
         )
         .await?;
     stream.write_all(b"</stream:stream>").await?;
+    Ok(())
+}
+
+// Ресурс XMPP используется АТС как имя рабочей станции для выбора номера.
+fn validate_xmpp_resource(resource: &str) -> Result<()> {
+    if resource.is_empty() || resource.len() > 64 {
+        bail!("XMPP-ресурс должен содержать от 1 до 64 символов")
+    }
+    if resource.chars().any(|ch| {
+        ch.is_control() || (!ch.is_ascii_alphanumeric() && !matches!(ch, '.' | '_' | '-'))
+    }) {
+        bail!("XMPP-ресурс содержит недопустимые символы")
+    }
     Ok(())
 }
 
@@ -697,6 +733,11 @@ impl eframe::App for GuiApp {
                     text_field(ui, "XMPP-сервер", &mut self.settings.xmpp_server);
                     text_field(ui, "Порт XMPP", &mut self.settings.xmpp_port);
                     text_field(ui, "JID учетной записи", &mut self.settings.xmpp_account);
+                    text_field(
+                        ui,
+                        "XMPP-ресурс (рабочая станция)",
+                        &mut self.settings.xmpp_resource,
+                    );
                     text_field(ui, "JID получателя", &mut self.settings.xmpp_recipient);
                     text_field(
                         ui,
