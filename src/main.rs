@@ -29,6 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing::{info, warn};
+use xphone::{Codec as SipCodec, Phone, PhoneBuilder};
 
 #[derive(Parser)]
 #[command(version, about = "Отслеживание заявок и XMPP/Miranda-интеграция")]
@@ -134,6 +135,7 @@ async fn main() -> Result<()> {
 const GUI_SERVICE: &str = "oz";
 const MSSQL_SECRET: &str = "mssql-connection-string";
 const XMPP_SECRET: &str = "xmpp-account-password";
+const SIP_SECRET: &str = "sip-1001-password";
 
 // Настройки GUI сериализуются в gui-settings.toml. Поля с паролями отсутствуют:
 // реальные значения загружаются из Credential Manager только в память процесса.
@@ -157,6 +159,10 @@ struct GuiSettings {
     xmpp_call_recipient: String,
     xmpp_caller_extension: String,
     call_target: String,
+    sip_enabled: bool,
+    sip_server: String,
+    sip_port: String,
+    sip_username: String,
     report_date: String,
     report_period: String,
 }
@@ -181,6 +187,10 @@ impl Default for GuiSettings {
             xmpp_call_recipient: "pbx@dns.sevnb.ru".to_owned(),
             xmpp_caller_extension: "132".to_owned(),
             call_target: String::new(),
+            sip_enabled: true,
+            sip_server: "10.33.1.82".to_owned(),
+            sip_port: "5060".to_owned(),
+            sip_username: "1001".to_owned(),
             report_date: "2026-09-01".to_owned(),
             report_period: "day".to_owned(),
         }
@@ -191,10 +201,14 @@ struct GuiApp {
     settings: GuiSettings,
     mssql_password: String,
     xmpp_password: String,
+    sip_password: String,
     remember_secrets: bool,
     status: String,
     running: bool,
     stop: Arc<AtomicBool>,
+    sip_stop: Arc<AtomicBool>,
+    sip_running: bool,
+    sip_ready: bool,
     result_rx: Receiver<String>,
     result_tx: Sender<String>,
 }
@@ -207,15 +221,20 @@ impl GuiApp {
         let settings = load_gui_settings().unwrap_or_default();
         let mssql_password = read_secret(MSSQL_SECRET).unwrap_or_default();
         let xmpp_password = read_secret(XMPP_SECRET).unwrap_or_default();
+        let sip_password = read_secret(SIP_SECRET).unwrap_or_default();
         let (result_tx, result_rx) = mpsc::channel();
         Self {
             settings,
             mssql_password,
             xmpp_password,
+            sip_password,
             remember_secrets: true,
             status: "Готово. Ожидание проверки заявок.".to_owned(),
             running: false,
             stop: Arc::new(AtomicBool::new(false)),
+            sip_stop: Arc::new(AtomicBool::new(false)),
+            sip_running: false,
+            sip_ready: false,
             result_rx,
             result_tx,
         }
@@ -229,6 +248,9 @@ impl GuiApp {
         if let Err(error) = self.save_settings() {
             self.status = format!("Ошибка сохранения: {error:#}");
             return;
+        }
+        if self.settings.sip_enabled && !self.sip_password.is_empty() {
+            self.start_virtual_sip();
         }
         let settings = self.settings.clone();
         let mssql_password = self.mssql_password.clone();
@@ -279,15 +301,81 @@ impl GuiApp {
         if self.remember_secrets {
             save_secret(MSSQL_SECRET, &self.mssql_password)?;
             save_secret(XMPP_SECRET, &self.xmpp_password)?;
+            save_secret(SIP_SECRET, &self.sip_password)?;
         }
         self.status = "Настройки сохранены.".to_owned();
         Ok(())
+    }
+
+    // Виртуальный аппарат должен быть зарегистрирован до отправки команды
+    // XMPP: АТС сначала вызывает его, а после автоответа набирает цель.
+    fn start_virtual_sip(&mut self) {
+        if self.sip_running {
+            return;
+        }
+        let server = self.settings.sip_server.trim().to_owned();
+        let port = match self.settings.sip_port.trim().parse::<u16>() {
+            Ok(port) => port,
+            Err(_) => {
+                self.status = "SIP не запущен: неверный порт АТС".to_owned();
+                return;
+            }
+        };
+        let username = self.settings.sip_username.trim().to_owned();
+        let password = self.sip_password.clone();
+        if server.is_empty() || username.is_empty() || password.is_empty() {
+            self.status = "SIP не запущен: заполните сервер, номер и Secret".to_owned();
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        self.sip_stop = Arc::clone(&stop);
+        self.sip_running = true;
+        self.sip_ready = false;
+        let tx = self.result_tx.clone();
+        thread::spawn(move || {
+            let config = PhoneBuilder::new()
+                .credentials(&username, &password, &server)
+                .port(port)
+                .codecs(vec![SipCodec::PCMA, SipCodec::TelephoneEvent])
+                .rtp_ports(10000, 20000)
+                .with_nat(true)
+                .nat_keepalive(Duration::from_secs(20))
+                .user_agent("OZ-virtual-phone/0.1")
+                .build();
+            let phone = Phone::new(config);
+            phone.on_incoming(|call| {
+                if let Err(error) = call.accept() {
+                    warn!(error = %error, "virtual SIP auto-answer failed");
+                }
+            });
+            match phone.connect() {
+                Ok(()) => {
+                    let _ = tx.send("OZ_FOCUS\nВиртуальный SIP-телефон 1001 зарегистрирован; автоответ включен.".to_owned());
+                    while !stop.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                    let _ = phone.disconnect();
+                }
+                Err(error) => {
+                    let _ = tx.send(format!("SIP-регистрация не выполнена: {error}"));
+                }
+            }
+        });
     }
 
     fn start_call(&mut self) {
         let target = self.settings.call_target.trim().to_owned();
         if let Err(error) = validate_call_target(&target) {
             self.status = format!("Звонок не отправлен: {error}");
+            return;
+        }
+        if self.settings.sip_enabled && (!self.sip_running || !self.sip_ready) {
+            if !self.sip_running {
+                self.start_virtual_sip();
+            }
+            self.status =
+                "Виртуальный SIP еще регистрируется; повторите дозвон после статуса Registered."
+                    .to_owned();
             return;
         }
         let server = self.settings.xmpp_server.clone();
@@ -696,6 +784,12 @@ impl eframe::App for GuiApp {
     // обновляем статус и рисуем форму; тяжелые операции выполняются в потоках.
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         if let Ok(message) = self.result_rx.try_recv() {
+            if message.starts_with("OZ_FOCUS\nВиртуальный SIP-телефон") {
+                self.sip_ready = true;
+            } else if message.starts_with("SIP-регистрация не выполнена:") {
+                self.sip_running = false;
+                self.sip_ready = false;
+            }
             if !self.settings.poll_enabled {
                 self.running = false;
             }
@@ -786,6 +880,28 @@ impl eframe::App for GuiApp {
                     }
                     ui.label("Уведомление отправляется один раз для каждого нового набора заявок.");
                 });
+            eframe::egui::CollapsingHeader::new("Виртуальный SIP-телефон")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.checkbox(
+                        &mut self.settings.sip_enabled,
+                        "Включить виртуальный телефон",
+                    );
+                    text_field(ui, "SIP-сервер АТС", &mut self.settings.sip_server);
+                    text_field(ui, "Порт SIP", &mut self.settings.sip_port);
+                    text_field(ui, "SIP-номер", &mut self.settings.sip_username);
+                    password_field(ui, "SIP Secret", &mut self.sip_password);
+                    ui.label("Автоответ включен; используется кодек G.711 A-law (PCMA).");
+                    if ui
+                        .add_enabled(
+                            self.settings.sip_enabled && !self.sip_password.is_empty(),
+                            eframe::egui::Button::new("Подключить SIP"),
+                        )
+                        .clicked()
+                    {
+                        self.start_virtual_sip();
+                    }
+                });
             ui.checkbox(
                 &mut self.remember_secrets,
                 "Хранить пароли в Credential Manager",
@@ -836,7 +952,10 @@ impl eframe::App for GuiApp {
                 .clicked()
             {
                 self.stop.store(true, Ordering::Relaxed);
+                self.sip_stop.store(true, Ordering::Relaxed);
                 self.running = false;
+                self.sip_running = false;
+                self.sip_ready = false;
                 self.status = "Остановка фонового опроса...".to_owned();
             }
             ui.separator();

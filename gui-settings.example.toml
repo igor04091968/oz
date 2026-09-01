@@ -15,3 +15,7 @@ xmpp_recipient = "user@dns.sevnb.ru"
 xmpp_call_recipient = "pbx@dns.sevnb.ru"
 xmpp_caller_extension = "132"
 call_target = "135"
+sip_enabled = true
+sip_server = "10.33.1.82"
+sip_port = "5060"
+sip_username = "1001"
