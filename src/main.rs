@@ -749,10 +749,10 @@ impl eframe::App for GuiApp {
                 &mut self.remember_secrets,
                 "Хранить пароли в Credential Manager",
             );
-            if ui.button("Сохранить настройки").clicked() {
-                if let Err(error) = self.save_settings() {
-                    self.status = format!("Ошибка сохранения: {error:#}");
-                }
+            if ui.button("Сохранить настройки").clicked()
+                && let Err(error) = self.save_settings()
+            {
+                self.status = format!("Ошибка сохранения: {error:#}");
             }
             eframe::egui::CollapsingHeader::new("Файлы и параметры")
                 .default_open(true)
