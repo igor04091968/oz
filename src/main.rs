@@ -135,7 +135,8 @@ async fn main() -> Result<()> {
 const GUI_SERVICE: &str = "oz";
 const MSSQL_SECRET: &str = "mssql-connection-string";
 const XMPP_SECRET: &str = "xmpp-account-password";
-const SIP_SECRET: &str = "sip-1001-password";
+const SIP_SECRET: &str = "sip-account-password";
+const LEGACY_SIP_SECRET: &str = "sip-1001-password";
 
 // Настройки GUI сериализуются в gui-settings.toml. Поля с паролями отсутствуют:
 // реальные значения загружаются из Credential Manager только в память процесса.
@@ -221,7 +222,9 @@ impl GuiApp {
         let settings = load_gui_settings().unwrap_or_default();
         let mssql_password = read_secret(MSSQL_SECRET).unwrap_or_default();
         let xmpp_password = read_secret(XMPP_SECRET).unwrap_or_default();
-        let sip_password = read_secret(SIP_SECRET).unwrap_or_default();
+        let sip_password = read_secret(SIP_SECRET)
+            .or_else(|_| read_secret(LEGACY_SIP_SECRET))
+            .unwrap_or_default();
         let (result_tx, result_rx) = mpsc::channel();
         Self {
             settings,
@@ -350,7 +353,9 @@ impl GuiApp {
             });
             match phone.connect() {
                 Ok(()) => {
-                    let _ = tx.send("OZ_FOCUS\nВиртуальный SIP-телефон 1001 зарегистрирован; автоответ включен.".to_owned());
+                    let _ = tx.send(format!(
+                        "OZ_FOCUS\nВиртуальный SIP-телефон {username} зарегистрирован; автоответ включен."
+                    ));
                     while !stop.load(Ordering::Relaxed) {
                         thread::sleep(Duration::from_secs(1));
                     }
@@ -900,6 +905,15 @@ impl eframe::App for GuiApp {
                         .clicked()
                     {
                         self.start_virtual_sip();
+                    }
+                    if ui
+                        .add_enabled(self.sip_running, eframe::egui::Button::new("Отключить SIP"))
+                        .clicked()
+                    {
+                        self.sip_stop.store(true, Ordering::Relaxed);
+                        self.sip_running = false;
+                        self.sip_ready = false;
+                        self.status = "Остановка виртуального SIP-телефона...".to_owned();
                     }
                 });
             ui.checkbox(
