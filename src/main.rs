@@ -746,8 +746,8 @@ impl eframe::App for GuiApp {
                     );
                     password_field(ui, "Пароль XMPP", &mut self.xmpp_password);
                     ui.label(format!(
-                        "Источник click-to-call: {} (JID OZ)",
-                        self.settings.xmpp_caller_extension
+                        "Источник click-to-call: ресурс {} (номер выбирает АТС)",
+                        self.settings.xmpp_resource
                     ));
                     text_field(
                         ui,
