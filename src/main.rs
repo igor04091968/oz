@@ -854,7 +854,7 @@ fn load_pcm_wav(path: &str) -> Result<Vec<i16>> {
     let mut samples = Vec::with_capacity(raw.len() / (channels as usize * 2));
     for frame in raw.chunks_exact(channels as usize * 2) {
         let mut sum = 0i32;
-        for channel in frame.chunks_exact(2) {
+        for channel in frame.chunks(2) {
             sum += i16::from_le_bytes(channel.try_into()?) as i32;
         }
         samples.push((sum / channels as i32) as i16);
