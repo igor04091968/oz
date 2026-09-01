@@ -224,23 +224,13 @@ impl GuiApp {
             return;
         }
         self.stop = Arc::new(AtomicBool::new(false));
-        let settings = self.settings.clone();
-        let mssql_password = self.mssql_password.clone();
-        let xmpp_password = self.xmpp_password.clone();
-        let remember_secrets = self.remember_secrets;
-        if let Err(error) = save_gui_settings(&settings)
-            .and_then(|_| write_runtime_config(&settings))
-            .and_then(|_| {
-                if remember_secrets {
-                    save_secret(MSSQL_SECRET, &mssql_password)?;
-                    save_secret(XMPP_SECRET, &xmpp_password)?;
-                }
-                Ok(())
-            })
-        {
+        if let Err(error) = self.save_settings() {
             self.status = format!("Ошибка сохранения: {error:#}");
             return;
         }
+        let settings = self.settings.clone();
+        let mssql_password = self.mssql_password.clone();
+        let xmpp_password = self.xmpp_password.clone();
 
         let tx = self.result_tx.clone();
         let config_path = settings.config_path.clone();
@@ -279,6 +269,17 @@ impl GuiApp {
                 }
             }
         });
+    }
+
+    fn save_settings(&mut self) -> Result<()> {
+        save_gui_settings(&self.settings)?;
+        write_runtime_config(&self.settings)?;
+        if self.remember_secrets {
+            save_secret(MSSQL_SECRET, &self.mssql_password)?;
+            save_secret(XMPP_SECRET, &self.xmpp_password)?;
+        }
+        self.status = "Настройки сохранены.".to_owned();
+        Ok(())
     }
 
     fn start_call(&mut self) {
@@ -748,6 +749,11 @@ impl eframe::App for GuiApp {
                 &mut self.remember_secrets,
                 "Хранить пароли в Credential Manager",
             );
+            if ui.button("Сохранить настройки").clicked() {
+                if let Err(error) = self.save_settings() {
+                    self.status = format!("Ошибка сохранения: {error:#}");
+                }
+            }
             eframe::egui::CollapsingHeader::new("Файлы и параметры")
                 .default_open(true)
                 .show(ui, |ui| {
