@@ -164,6 +164,8 @@ struct GuiSettings {
     sip_server: String,
     sip_port: String,
     sip_username: String,
+    sip_audio_enabled: bool,
+    sip_audio_file: String,
     report_date: String,
     report_period: String,
 }
@@ -186,12 +188,14 @@ impl Default for GuiSettings {
             xmpp_resource: "oz".to_owned(),
             xmpp_recipient: String::new(),
             xmpp_call_recipient: "pbx@dns.sevnb.ru".to_owned(),
-            xmpp_caller_extension: "1001".to_owned(),
+            xmpp_caller_extension: "1000".to_owned(),
             call_target: String::new(),
             sip_enabled: true,
             sip_server: "10.33.1.82".to_owned(),
             sip_port: "5060".to_owned(),
-            sip_username: "1001".to_owned(),
+            sip_username: "1000".to_owned(),
+            sip_audio_enabled: true,
+            sip_audio_file: "call_notice.wav".to_owned(),
             report_date: "2026-09-01".to_owned(),
             report_period: "day".to_owned(),
         }
@@ -326,6 +330,8 @@ impl GuiApp {
         };
         let username = self.settings.sip_username.trim().to_owned();
         let password = self.sip_password.clone();
+        let audio_enabled = self.settings.sip_audio_enabled;
+        let audio_file = self.settings.sip_audio_file.trim().to_owned();
         if server.is_empty() || username.is_empty() || password.is_empty() {
             self.status = "SIP не запущен: заполните сервер, номер и Secret".to_owned();
             return;
@@ -346,7 +352,28 @@ impl GuiApp {
                 .user_agent("OZ-virtual-phone/0.1")
                 .build();
             let phone = Phone::new(config);
-            phone.on_incoming(|call| {
+            phone.on_incoming(move |call| {
+                // Callback регистрируется до автоответа: xphone вызовет его
+                // после согласования SDP и готовности RTP-медиаканала.
+                if audio_enabled {
+                    match load_pcm_wav(&audio_file) {
+                        Ok(samples) => {
+                            let weak_call = Arc::downgrade(&call);
+                            let file_name = audio_file.clone();
+                            call.on_media(move || {
+                                if let Some(call) = weak_call.upgrade()
+                                    && let Some(writer) = call.paced_pcm_writer()
+                                {
+                                    let _ = writer.send(samples.clone());
+                                    info!(file = %file_name, "SIP voice message playback started");
+                                }
+                            });
+                        }
+                        Err(error) => {
+                            warn!(file = %audio_file, error = %error, "SIP voice message unavailable");
+                        }
+                    }
+                }
                 if let Err(error) = call.accept() {
                     warn!(error = %error, "virtual SIP auto-answer failed");
                 }
@@ -784,6 +811,76 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+// Читаем только несжатый PCM WAV: файл можно подготовить заранее без
+// внешнего медиасервера и без передачи текста сообщения облачному TTS.
+fn load_pcm_wav(path: &str) -> Result<Vec<i16>> {
+    let data = fs::read(path).with_context(|| format!("не удалось прочитать WAV: {path}"))?;
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        bail!("файл не является WAV RIFF");
+    }
+    let mut offset = 12usize;
+    let mut channels = 0u16;
+    let mut sample_rate = 0u32;
+    let mut bits_per_sample = 0u16;
+    let mut audio_format = 0u16;
+    let mut pcm_data = None;
+    while offset + 8 <= data.len() {
+        let id = &data[offset..offset + 4];
+        let size = u32::from_le_bytes(data[offset + 4..offset + 8].try_into()?) as usize;
+        let start = offset + 8;
+        let end = start.checked_add(size).context("поврежденный WAV chunk")?;
+        if end > data.len() {
+            bail!("WAV chunk выходит за пределы файла");
+        }
+        match id {
+            b"fmt " if size >= 16 => {
+                audio_format = u16::from_le_bytes(data[start..start + 2].try_into()?);
+                channels = u16::from_le_bytes(data[start + 2..start + 4].try_into()?);
+                sample_rate = u32::from_le_bytes(data[start + 4..start + 8].try_into()?);
+                bits_per_sample = u16::from_le_bytes(data[start + 14..start + 16].try_into()?);
+            }
+            b"data" => pcm_data = Some(&data[start..end]),
+            _ => {}
+        }
+        offset = end + (size % 2);
+    }
+    if audio_format != 1 || channels == 0 || sample_rate == 0 || bits_per_sample != 16 {
+        bail!("требуется несжатый 16-битный PCM WAV");
+    }
+    let raw = pcm_data.context("в WAV отсутствует data chunk")?;
+    if raw.len() % (channels as usize * 2) != 0 {
+        bail!("размер PCM-данных не соответствует числу каналов");
+    }
+    let mut samples = Vec::with_capacity(raw.len() / (channels as usize * 2));
+    for frame in raw.chunks_exact(channels as usize * 2) {
+        let mut sum = 0i32;
+        for channel in frame.chunks_exact(2) {
+            sum += i16::from_le_bytes(channel.try_into()?) as i32;
+        }
+        samples.push((sum / channels as i32) as i16);
+    }
+    if sample_rate != 8000 {
+        samples = resample_pcm(&samples, sample_rate)?;
+    }
+    if samples.is_empty() {
+        bail!("WAV не содержит сэмплов");
+    }
+    Ok(samples)
+}
+
+fn resample_pcm(samples: &[i16], input_rate: u32) -> Result<Vec<i16>> {
+    if input_rate == 0 {
+        bail!("некорректная частота дискретизации");
+    }
+    let output_len = ((samples.len() as u64 * 8000) / input_rate as u64) as usize;
+    let mut output = Vec::with_capacity(output_len.max(1));
+    for index in 0..output_len {
+        let source = ((index as u64 * input_rate as u64) / 8000) as usize;
+        output.push(samples[source.min(samples.len() - 1)]);
+    }
+    Ok(output)
+}
+
 impl eframe::App for GuiApp {
     // egui вызывает update часто. Здесь только читаем сообщения из канала,
     // обновляем статус и рисуем форму; тяжелые операции выполняются в потоках.
@@ -897,6 +994,12 @@ impl eframe::App for GuiApp {
                     text_field(ui, "SIP-номер", &mut self.settings.sip_username);
                     password_field(ui, "SIP Secret", &mut self.sip_password);
                     ui.label("Автоответ включен; используется кодек G.711 A-law (PCMA).");
+                    ui.checkbox(
+                        &mut self.settings.sip_audio_enabled,
+                        "Проигрывать голосовое сообщение",
+                    );
+                    text_field(ui, "Файл сообщения WAV", &mut self.settings.sip_audio_file);
+                    ui.label("Формат: PCM, 8/16 kHz, 16 бит, mono.");
                     if ui
                         .add_enabled(
                             self.settings.sip_enabled && !self.sip_password.is_empty(),
