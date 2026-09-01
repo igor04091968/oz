@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -38,10 +38,11 @@ struct Cli {
 }
 
 // Подкоманды разделены по назначению: process-requests проверяет заявки,
-// gui запускает настольный интерфейс.
+// report формирует сводку за день или неделю, gui запускает интерфейс.
 #[derive(Subcommand)]
 enum Command {
     ProcessRequests(CommonArgs),
+    Report(ReportArgs),
     Gui,
 }
 
@@ -51,6 +52,23 @@ enum Command {
 struct CommonArgs {
     #[arg(long, env = "ORCH_CONFIG", default_value = "config.toml")]
     config: String,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ReportPeriod {
+    Day,
+    Week,
+}
+
+#[derive(Args, Clone)]
+struct ReportArgs {
+    #[arg(long, env = "ORCH_CONFIG", default_value = "config.toml")]
+    config: String,
+    /// Опорная дата в формате YYYY-MM-DD; для week берется предыдущий 6-дневный период.
+    #[arg(long)]
+    date: String,
+    #[arg(long, value_enum, default_value_t = ReportPeriod::Day)]
+    period: ReportPeriod,
 }
 
 // Эти структуры описывают runtime-конфигурацию. Они не содержат паролей и
@@ -105,6 +123,10 @@ async fn main() -> Result<()> {
             let config = load_config(&args.config)?;
             process_requests(&config).await
         }
+        Some(Command::Report(args)) => {
+            let config = load_config(&args.config)?;
+            report_requests(&config, args.period, &args.date).await
+        }
         Some(Command::Gui) => run_gui(),
     }
 }
@@ -134,6 +156,8 @@ struct GuiSettings {
     xmpp_call_recipient: String,
     xmpp_caller_extension: String,
     call_target: String,
+    report_date: String,
+    report_period: String,
 }
 
 impl Default for GuiSettings {
@@ -155,6 +179,8 @@ impl Default for GuiSettings {
             xmpp_call_recipient: "pbx@dns.sevnb.ru".to_owned(),
             xmpp_caller_extension: "1000".to_owned(),
             call_target: String::new(),
+            report_date: "2026-09-01".to_owned(),
+            report_period: "day".to_owned(),
         }
     }
 }
@@ -278,6 +304,83 @@ impl GuiApp {
                     format!("OZ_FOCUS\nКоманда звонка отправлена на {target} от номера 1000.")
                 }
                 Err(error) => format!("Звонок не отправлен: {error}"),
+            };
+            let _ = tx.send(message);
+        });
+    }
+
+    fn start_xmpp_test(&mut self) {
+        let recipient = self.settings.xmpp_recipient.trim().to_owned();
+        if recipient.is_empty() {
+            self.status = "Тест XMPP не запущен: укажите JID получателя уведомлений".to_owned();
+            return;
+        }
+        let server = self.settings.xmpp_server.clone();
+        let port = self.settings.xmpp_port.clone();
+        let account = self.settings.xmpp_account.clone();
+        let password = self.xmpp_password.clone();
+        let tx = self.result_tx.clone();
+        self.status = format!("Тест XMPP: отправка сообщения на {recipient}...");
+        thread::spawn(move || {
+            let result = send_xmpp_message_blocking(
+                &server,
+                &port,
+                &account,
+                &password,
+                &recipient,
+                "ОЗ: тестовое сообщение XMPP, ответ не требуется.",
+            );
+            let message = match result {
+                Ok(()) => format!("OZ_FOCUS\nТест XMPP успешно отправлен на {recipient}."),
+                Err(error) => format!("Тест XMPP не пройден: {error}"),
+            };
+            let _ = tx.send(message);
+        });
+    }
+
+    fn start_report(&mut self) {
+        let date = self.settings.report_date.trim().to_owned();
+        let period = self.settings.report_period.trim().to_owned();
+        if let Err(error) = validate_report_date(&date) {
+            self.status = format!("Отчет не сформирован: {error}");
+            return;
+        }
+        if period != "day" && period != "week" {
+            self.status = "Отчет не сформирован: период должен быть day или week".to_owned();
+            return;
+        }
+        let settings = self.settings.clone();
+        let password = self.mssql_password.clone();
+        let tx = self.result_tx.clone();
+        self.status = "Формирование отчета...".to_owned();
+        thread::spawn(move || {
+            let mut command = std::process::Command::new(
+                std::env::current_exe().unwrap_or_else(|_| PathBuf::from("oz.exe")),
+            );
+            command.args([
+                "report",
+                "--period",
+                &period,
+                "--date",
+                &date,
+                "--config",
+                &settings.config_path,
+            ]);
+            command.env(
+                "MSSQL_CONNECTION_STRING",
+                build_connection_string(&settings, &password),
+            );
+            let message = match command.output() {
+                Ok(output) if output.status.success() => {
+                    String::from_utf8_lossy(&output.stdout).into_owned()
+                }
+                Ok(output) => format!(
+                    "Ошибка отчета ({}):\n{}{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                Err(error) => format!("Не удалось запустить отчет: {error}"),
             };
             let _ = tx.send(message);
         });
@@ -529,7 +632,11 @@ async fn read_xmpp_until(stream: &mut TcpStream, marker: &str, context: &str) ->
             bail!("XMPP connection closed during {context}");
         }
         buffer.extend_from_slice(&chunk[..read]);
-        if String::from_utf8_lossy(&buffer).contains(marker) {
+        let response = String::from_utf8_lossy(&buffer);
+        if response.contains("<failure") || response.contains("<stream:error") {
+            bail!("XMPP server returned an error during {context}");
+        }
+        if response.contains(marker) {
             return Ok(());
         }
         if buffer.len() > 128 * 1024 {
@@ -615,6 +722,26 @@ impl eframe::App for GuiApp {
                     {
                         self.start_call();
                     }
+                    if ui
+                        .add_enabled(
+                            !self.settings.call_target.trim().is_empty()
+                                && !self.xmpp_password.is_empty(),
+                            eframe::egui::Button::new("Тест дозвона"),
+                        )
+                        .clicked()
+                    {
+                        self.start_call();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.settings.xmpp_recipient.trim().is_empty()
+                                && !self.xmpp_password.is_empty(),
+                            eframe::egui::Button::new("Тест XMPP"),
+                        )
+                        .clicked()
+                    {
+                        self.start_xmpp_test();
+                    }
                     ui.label("Уведомление отправляется один раз для каждого нового набора заявок.");
                 });
             ui.checkbox(
@@ -627,6 +754,28 @@ impl eframe::App for GuiApp {
                     text_field(ui, "Конфигурация", &mut self.settings.config_path);
                     text_field(ui, "SQL запрос", &mut self.settings.query_file);
                     text_field(ui, "Журнал SQLite", &mut self.settings.audit_db_path);
+                });
+            eframe::egui::CollapsingHeader::new("Отчет за период")
+                .default_open(true)
+                .show(ui, |ui| {
+                    text_field(ui, "Опорная дата", &mut self.settings.report_date);
+                    eframe::egui::ComboBox::from_label("Период")
+                        .selected_text(&self.settings.report_period)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.settings.report_period,
+                                "day".to_owned(),
+                                "День",
+                            );
+                            ui.selectable_value(
+                                &mut self.settings.report_period,
+                                "week".to_owned(),
+                                "Неделя",
+                            );
+                        });
+                    if ui.button("Сформировать отчет").clicked() {
+                        self.start_report();
+                    }
                 });
             ui.separator();
             if ui
@@ -836,6 +985,94 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+// Отчет намеренно выводит только номера и технические статусы. ФИО, причины
+// удаленной работы и другие поля заявки в консольный результат не попадают.
+async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -> Result<()> {
+    validate_report_date(date)?;
+    let requests_config = config
+        .requests
+        .as_ref()
+        .context("requests section is required for report")?;
+    let source_query = fs::read_to_string(&requests_config.query_file)
+        .with_context(|| format!("read request query file {}", requests_config.query_file))?;
+    let query = query_for_report_period(&source_query, period, date)?;
+    let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
+
+    let mut processed = 0usize;
+    let mut waiting = 0usize;
+    let mut rows = Vec::with_capacity(requests.len());
+    for request in requests {
+        // Источник истины для исполнения — por_neisp из MSSQL. Локальный
+        // аудит не подменяет этот статус и нужен для повторных запусков OZ.
+        let status = if request.por_neisp == 0 {
+            processed += 1;
+            "processed"
+        } else {
+            waiting += 1;
+            "waiting"
+        };
+        rows.push((request.request_num, status));
+    }
+
+    println!(
+        "OZ_REPORT period={} anchor_date={} total={} processed={} waiting={}",
+        match period {
+            ReportPeriod::Day => "day",
+            ReportPeriod::Week => "week",
+        },
+        date,
+        rows.len(),
+        processed,
+        waiting
+    );
+    for (number, status) in rows {
+        println!("OZ_REQUEST num={} status={status}", number);
+    }
+    Ok(())
+}
+
+fn validate_report_date(date: &str) -> Result<()> {
+    let valid = date.len() == 10
+        && date.as_bytes()[4] == b'-'
+        && date.as_bytes()[7] == b'-'
+        && date
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit());
+    if !valid {
+        bail!("date must have YYYY-MM-DD format")
+    }
+    Ok(())
+}
+
+fn query_for_report_period(query: &str, period: ReportPeriod, date: &str) -> Result<String> {
+    let end = format!("set @d2 = '{date}';");
+    let start = match period {
+        ReportPeriod::Day => format!("set @d1 = '{date}';"),
+        // Rolling seven calendar days ending on the requested date.
+        ReportPeriod::Week => format!("set @d1 = dateadd(day, -6, '{date}');"),
+    };
+    let mut replaced_start = false;
+    let mut replaced_end = false;
+    let mut lines = Vec::new();
+    for line in query.lines() {
+        let trimmed = line.trim_start().to_ascii_lowercase();
+        if trimmed.starts_with("set @d1") {
+            lines.push(start.clone());
+            replaced_start = true;
+        } else if trimmed.starts_with("set @d2") {
+            lines.push(end.clone());
+            replaced_end = true;
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    if !replaced_start || !replaced_end {
+        bail!("request query must define @d1 and @d2")
+    }
+    Ok(lines.join("\n"))
+}
+
 async fn fetch_remote_work_requests(
     config: &SqlConfig,
     query: &str,
@@ -967,6 +1204,28 @@ mod tests {
     fn poll_result_is_parsed() {
         let result = parse_poll_result("OZ_RESULT fetched=4 pending=2 fingerprint=abc123");
         assert_eq!(result, Some((2, "abc123".to_owned())));
+    }
+
+    #[test]
+    fn report_query_uses_requested_day() {
+        let query = "set @d1 = '20260801';\nset @d2 = '20260825';\nselect 1;";
+        let actual = query_for_report_period(query, ReportPeriod::Day, "2026-09-01").unwrap();
+        assert!(actual.contains("set @d1 = '2026-09-01';"));
+        assert!(actual.contains("set @d2 = '2026-09-01';"));
+    }
+
+    #[test]
+    fn report_query_uses_seven_day_window() {
+        let query = "set @d1 = '20260801';\nset @d2 = '20260825';";
+        let actual = query_for_report_period(query, ReportPeriod::Week, "2026-09-01").unwrap();
+        assert!(actual.contains("dateadd(day, -6, '2026-09-01')"));
+        assert!(actual.contains("set @d2 = '2026-09-01';"));
+    }
+
+    #[test]
+    fn report_date_format_is_checked() {
+        assert!(validate_report_date("2026-09-01").is_ok());
+        assert!(validate_report_date("20260901").is_err());
     }
 
     #[test]
