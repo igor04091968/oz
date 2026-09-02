@@ -143,6 +143,7 @@ const MSSQL_SECRET: &str = "mssql-connection-string";
 const XMPP_SECRET: &str = "xmpp-account-password";
 const SIP_SECRET: &str = "sip-account-password";
 const LEGACY_SIP_SECRET: &str = "sip-1001-password";
+const PFSENSE_API_KEY: &str = "pfsense-api-key";
 
 // Настройки GUI сериализуются в gui-settings.toml. Поля с паролями отсутствуют:
 // реальные значения загружаются из Credential Manager только в память процесса.
@@ -175,6 +176,9 @@ struct GuiSettings {
     sip_audio_file: String,
     report_date: String,
     report_period: String,
+    pfsense_enabled: bool,
+    pfsense_url: String,
+    pfsense_timeout_seconds: String,
 }
 
 impl Default for GuiSettings {
@@ -206,6 +210,9 @@ impl Default for GuiSettings {
             sip_audio_file: String::new(),
             report_date: "2026-09-01".to_owned(),
             report_period: "day".to_owned(),
+            pfsense_enabled: false,
+            pfsense_url: "https://10.35.0.1".to_owned(),
+            pfsense_timeout_seconds: "15".to_owned(),
         }
     }
 }
@@ -215,6 +222,7 @@ struct GuiApp {
     mssql_password: String,
     xmpp_password: String,
     sip_password: String,
+    pfsense_api_key: String,
     remember_secrets: bool,
     status: String,
     running: bool,
@@ -238,12 +246,14 @@ impl GuiApp {
         let sip_password = read_secret(SIP_SECRET)
             .or_else(|_| read_secret(LEGACY_SIP_SECRET))
             .unwrap_or_default();
+        let pfsense_api_key = read_secret(PFSENSE_API_KEY).unwrap_or_default();
         let (result_tx, result_rx) = mpsc::channel();
         Self {
             settings,
             mssql_password,
             xmpp_password,
             sip_password,
+            pfsense_api_key,
             remember_secrets: true,
             status: "Готово. Ожидание проверки заявок.".to_owned(),
             running: false,
@@ -323,6 +333,7 @@ impl GuiApp {
             save_secret(MSSQL_SECRET, &self.mssql_password)?;
             save_secret(XMPP_SECRET, &self.xmpp_password)?;
             save_secret(SIP_SECRET, &self.sip_password)?;
+            save_secret(PFSENSE_API_KEY, &self.pfsense_api_key)?;
         }
         self.status = "Настройки сохранены.".to_owned();
         Ok(())
@@ -493,6 +504,39 @@ impl GuiApp {
             let message = match result {
                 Ok(()) => format!("OZ_FOCUS\nТест XMPP успешно отправлен на {recipient}."),
                 Err(error) => format!("Тест XMPP не пройден: {error}"),
+            };
+            let _ = tx.send(message);
+        });
+    }
+
+    fn start_pfsense_test(&mut self) {
+        let base_url = self.settings.pfsense_url.trim().to_owned();
+        let timeout = self
+            .settings
+            .pfsense_timeout_seconds
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(15)
+            .clamp(5, 120);
+        let api_key = self.pfsense_api_key.clone();
+        let tx = self.result_tx.clone();
+        if !self.settings.pfsense_enabled {
+            self.status = "pfSense API: включите интеграцию в настройках.".to_owned();
+            return;
+        }
+        if api_key.trim().is_empty() {
+            self.status =
+                "pfSense API: укажите API-ключ; он сохранится только в Credential Manager."
+                    .to_owned();
+            return;
+        }
+        self.status = "Проверка pfSense REST API v2...".to_owned();
+        thread::spawn(move || {
+            let message = match PfsenseClient::new(&base_url, &api_key, timeout)
+                .and_then(|client| client.health_check())
+            {
+                Ok(summary) => format!("OZ_FOCUS\npfSense REST API v2 доступен. {summary}"),
+                Err(error) => format!("pfSense REST API v2: проверка не пройдена: {error:#}"),
             };
             let _ = tx.send(message);
         });
@@ -1082,6 +1126,26 @@ impl eframe::App for GuiApp {
                         "Проигрывать голосовое сообщение",
                     );
                     text_field(ui, "Файл сообщения WAV", &mut self.settings.sip_audio_file);
+                    ui.separator();
+                    ui.label(eframe::egui::RichText::new("pfSense REST API v2").strong());
+                    ui.checkbox(&mut self.settings.pfsense_enabled, "Включить интеграцию");
+                    text_field(ui, "URL pfSense", &mut self.settings.pfsense_url);
+                    text_field(
+                        ui,
+                        "Таймаут, секунд",
+                        &mut self.settings.pfsense_timeout_seconds,
+                    );
+                    password_field(ui, "API-ключ", &mut self.pfsense_api_key);
+                    if ui
+                        .add_enabled(
+                            self.settings.pfsense_enabled && !self.pfsense_api_key.is_empty(),
+                            eframe::egui::Button::new("Проверить API v2"),
+                        )
+                        .clicked()
+                    {
+                        self.start_pfsense_test();
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("Заявки", |ui| {
                     ui.set_min_width(440.0);
@@ -1354,6 +1418,11 @@ query_file = "{}"
 query_file = {:?}
 mark_unapproved_as_seen = false
 poll_lookback_days = {}
+
+[pfsense]
+base_url = {:?}
+api_key_env = "OZ_PFSENSE_API_KEY"
+timeout_seconds = {}
 "#,
         interval_seconds,
         settings.audit_db_path,
@@ -1366,7 +1435,13 @@ poll_lookback_days = {}
             .poll_lookback_days
             .parse::<u32>()
             .unwrap_or(default_poll_lookback_days())
-            .max(1)
+            .max(1),
+        settings.pfsense_url,
+        settings
+            .pfsense_timeout_seconds
+            .parse::<u64>()
+            .unwrap_or(15)
+            .clamp(5, 120)
     );
     fs::write(&settings.config_path, config)
         .with_context(|| format!("write {}", settings.config_path))
@@ -1666,6 +1741,66 @@ impl SqlConfig {
     }
 }
 
+// Read-only клиент pfSense API v2. Ключ передается в заголовке X-API-Key и
+// никогда не включается в URL, сообщения журнала или текст ошибки.
+struct PfsenseClient {
+    client: reqwest::blocking::Client,
+    base_url: String,
+    api_key: String,
+}
+
+impl PfsenseClient {
+    fn new(base_url: &str, api_key: &str, timeout_seconds: u64) -> Result<Self> {
+        let base_url = base_url.trim().trim_end_matches('/').to_owned();
+        if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+            bail!("URL pfSense должен начинаться с http:// или https://");
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(timeout_seconds.clamp(5, 120)))
+            .build()
+            .context("создание HTTP-клиента pfSense")?;
+        Ok(Self {
+            client,
+            base_url,
+            api_key: api_key.to_owned(),
+        })
+    }
+
+    fn get_json(&self, path: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v2/{}", self.base_url, path.trim_start_matches('/'));
+        let response = self
+            .client
+            .get(url)
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .context("запрос к pfSense REST API v2")?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("pfSense API вернул HTTP {status}");
+        }
+        response
+            .json::<serde_json::Value>()
+            .context("разбор ответа pfSense API")
+    }
+
+    fn health_check(&self) -> Result<String> {
+        let version = self.get_json("system/restapi/version")?;
+        let rules = self.get_json("firewall/rules")?;
+        let version_text = version
+            .pointer("/data/version")
+            .or_else(|| version.pointer("/data"))
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "версия не указана".to_owned());
+        let rule_count = rules
+            .pointer("/data")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        Ok(format!(
+            "версия API: {version_text}; правил firewall: {rule_count}"
+        ))
+    }
+}
+
 fn remote_work_request_from_row(row: tiberius::Row) -> Result<RemoteWorkRequest> {
     Ok(RemoteWorkRequest {
         request_num: get_required_str(&row, "num1")?,
@@ -1829,5 +1964,11 @@ mod tests {
             "MSSQL_CONNECTION_STRING"
         );
         assert!(!raw.contains("password"));
+    }
+
+    #[test]
+    fn pfsense_url_must_use_http_scheme() {
+        assert!(PfsenseClient::new("10.35.0.1", "test", 15).is_err());
+        assert!(PfsenseClient::new("https://10.35.0.1", "test", 15).is_ok());
     }
 }

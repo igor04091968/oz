@@ -10,3 +10,8 @@ default_connection_string = "server=tcp:srv-db,1433;database=rd_all;TrustServerC
 query_file = "sql/remote_work_requests.sql"
 mark_unapproved_as_seen = false
 poll_lookback_days = 30
+
+[pfsense]
+base_url = "https://10.35.0.1"
+api_key_env = "OZ_PFSENSE_API_KEY"
+timeout_seconds = 15
