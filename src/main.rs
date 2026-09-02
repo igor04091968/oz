@@ -595,16 +595,19 @@ fn run_gui_poll(
             if settings.xmpp_recipient.trim().is_empty() {
                 *notified_fingerprint = fingerprint.clone();
                 message = format!(
-                    "OZ_FOCUS\nНайдено необработанных заявок: {pending}. Номера: {pending_list}. Укажите JID получателя XMPP.\n{message}"
+                    "OZ_FOCUS\n{}. Укажите JID получателя XMPP.\n{message}",
+                    format_pending_announcement(pending, &pending_list)
                 );
             } else if xmpp_password.is_empty() {
                 *notified_fingerprint = fingerprint.clone();
                 message = format!(
-                    "OZ_FOCUS\nНайдено необработанных заявок: {pending}. Номера: {pending_list}. Укажите пароль XMPP.\n{message}"
+                    "OZ_FOCUS\n{}. Укажите пароль XMPP.\n{message}",
+                    format_pending_announcement(pending, &pending_list)
                 );
             } else {
                 let body = format!(
-                    "ОЗ: обнаружено необработанных заявок: {pending}. Номера заявок: {pending_list}. Требуется проверка в приложении."
+                    "ОЗ: {}. Требуется проверка в приложении.",
+                    format_pending_announcement(pending, &pending_list)
                 );
                 let xmpp_result = std::thread::Builder::new()
                     .name("oz-xmpp".to_owned())
@@ -632,7 +635,8 @@ fn run_gui_poll(
                     Ok(()) => {
                         *notified_fingerprint = fingerprint;
                         message = format!(
-                            "OZ_FOCUS\nОтправлено уведомление в Miranda. Необработанных заявок: {pending}. Номера: {pending_list}.\n{message}"
+                            "OZ_FOCUS\nОтправлено уведомление в Miranda. {}\n{message}",
+                            format_pending_announcement(pending, &pending_list)
                         );
                     }
                     Err(error) => {
@@ -686,9 +690,11 @@ fn format_request_numbers(numbers: &[String]) -> String {
 }
 
 fn format_pending_announcement(pending: usize, numbers: &str) -> String {
-    format!(
-        "Количество необработанных заявок на удаленное подключение: {pending}. Номера заявок: {numbers}."
-    )
+    if pending == 0 {
+        "Необработанных заявок нет".to_owned()
+    } else {
+        format!("Необработанных заявок - {pending} штук, номера: {numbers}")
+    }
 }
 
 // Блокирующая обертка нужна GUI-потоку: внутри создается короткоживущий Tokio
@@ -1610,7 +1616,15 @@ mod tests {
     fn pending_announcement_contains_request_numbers() {
         assert_eq!(
             format_pending_announcement(2, "101, 205"),
-            "Количество необработанных заявок на удаленное подключение: 2. Номера заявок: 101, 205."
+            "Необработанных заявок - 2 штук, номера: 101, 205"
+        );
+    }
+
+    #[test]
+    fn empty_pending_announcement_has_no_number_list() {
+        assert_eq!(
+            format_pending_announcement(0, "нет"),
+            "Необработанных заявок нет"
         );
     }
 
