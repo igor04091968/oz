@@ -98,6 +98,12 @@ struct SqlConfig {
 struct RequestsConfig {
     query_file: String,
     mark_unapproved_as_seen: bool,
+    #[serde(default = "default_poll_lookback_days")]
+    poll_lookback_days: u32,
+}
+
+fn default_poll_lookback_days() -> u32 {
+    30
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +151,7 @@ const LEGACY_SIP_SECRET: &str = "sip-1001-password";
 struct GuiSettings {
     config_path: String,
     poll_interval_seconds: String,
+    poll_lookback_days: String,
     poll_enabled: bool,
     sql_server: String,
     sql_port: String,
@@ -175,6 +182,7 @@ impl Default for GuiSettings {
         Self {
             config_path: "config.toml".to_owned(),
             poll_interval_seconds: "60".to_owned(),
+            poll_lookback_days: "30".to_owned(),
             poll_enabled: true,
             sql_server: "srv-db".to_owned(),
             sql_port: "1433".to_owned(),
@@ -1029,6 +1037,11 @@ impl eframe::App for GuiApp {
                         "Интервал, секунд",
                         &mut self.settings.poll_interval_seconds,
                     );
+                    text_field(
+                        ui,
+                        "Глубина выборки, дней",
+                        &mut self.settings.poll_lookback_days,
+                    );
                     text_field(ui, "XMPP-сервер", &mut self.settings.xmpp_server);
                     text_field(ui, "Порт XMPP", &mut self.settings.xmpp_port);
                     text_field(ui, "JID учетной записи", &mut self.settings.xmpp_account);
@@ -1269,6 +1282,7 @@ query_file = "{}"
 [requests]
 query_file = {:?}
 mark_unapproved_as_seen = false
+poll_lookback_days = {}
 "#,
         interval_seconds,
         settings.audit_db_path,
@@ -1276,7 +1290,12 @@ mark_unapproved_as_seen = false
         settings.sql_port,
         settings.sql_database,
         settings.query_file,
-        settings.query_file
+        settings.query_file,
+        settings
+            .poll_lookback_days
+            .parse::<u32>()
+            .unwrap_or(default_poll_lookback_days())
+            .max(1)
     );
     fs::write(&settings.config_path, config)
         .with_context(|| format!("write {}", settings.config_path))
@@ -1314,8 +1333,9 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
         .as_ref()
         .context("requests section is required for process-requests")?;
     let audit = Audit::open(&config.runtime.audit_db_path)?;
-    let query = fs::read_to_string(&requests_config.query_file)
+    let source_query = fs::read_to_string(&requests_config.query_file)
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
+    let query = query_for_poll_lookback(&source_query, requests_config.poll_lookback_days)?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
 
     info!(count = requests.len(), "fetched remote work requests");
@@ -1459,6 +1479,36 @@ fn query_for_report_period(query: &str, period: ReportPeriod, date: &str) -> Res
             replaced_start = true;
         } else if trimmed.starts_with("set @d2") {
             lines.push(end.clone());
+            replaced_end = true;
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    if !replaced_start || !replaced_end {
+        bail!("request query must define @d1 and @d2")
+    }
+    Ok(lines.join("\n"))
+}
+
+// Фоновый опрос использует скользящее окно, чтобы даты в SQL-файле не
+// приходилось менять вручную. Граница периода вычисляется самим SQL Server.
+fn query_for_poll_lookback(query: &str, lookback_days: u32) -> Result<String> {
+    let days = lookback_days.max(1);
+    let start = format!(
+        "set @d1 = dateadd(day, -{}, cast(getdate() as date));",
+        days.saturating_sub(1)
+    );
+    let end = "set @d2 = cast(getdate() as date);";
+    let mut replaced_start = false;
+    let mut replaced_end = false;
+    let mut lines = Vec::new();
+    for line in query.lines() {
+        let trimmed = line.trim_start().to_ascii_lowercase();
+        if trimmed.starts_with("set @d1") {
+            lines.push(start.clone());
+            replaced_start = true;
+        } else if trimmed.starts_with("set @d2") {
+            lines.push(end.to_owned());
             replaced_end = true;
         } else {
             lines.push(line.to_owned());
@@ -1634,6 +1684,14 @@ mod tests {
         let actual = query_for_report_period(query, ReportPeriod::Day, "2026-09-01").unwrap();
         assert!(actual.contains("set @d1 = '2026-09-01';"));
         assert!(actual.contains("set @d2 = '2026-09-01';"));
+    }
+
+    #[test]
+    fn poll_query_uses_dynamic_lookback_window() {
+        let query = "set @d1 = '20260801';\nset @d2 = '20260825';\nselect 1;";
+        let actual = query_for_poll_lookback(query, 30).unwrap();
+        assert!(actual.contains("set @d1 = dateadd(day, -29, cast(getdate() as date));"));
+        assert!(actual.contains("set @d2 = cast(getdate() as date);"));
     }
 
     #[test]

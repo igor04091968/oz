@@ -9,3 +9,4 @@ default_connection_string = "server=tcp:srv-db,1433;database=rd_all;TrustServerC
 [requests]
 query_file = "sql/remote_work_requests.sql"
 mark_unapproved_as_seen = false
+poll_lookback_days = 30

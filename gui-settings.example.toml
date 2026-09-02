@@ -1,5 +1,6 @@
 config_path = "config.toml"
 poll_interval_seconds = "60"
+poll_lookback_days = "30"
 poll_enabled = true
 sql_server = "srv-db"
 sql_port = "1433"
