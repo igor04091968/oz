@@ -1015,7 +1015,7 @@ impl eframe::App for GuiApp {
             }
         }
         ctx.request_repaint_after(Duration::from_millis(250));
-        eframe::egui::CentralPanel::default().show(ctx, |ui| {
+        eframe::egui::TopBottomPanel::top("oz_top_panel").show(ctx, |ui| {
             eframe::egui::Frame::none()
                 .fill(eframe::egui::Color32::from_rgb(0, 120, 212))
                 .inner_margin(eframe::egui::Margin::same(14.0))
@@ -1032,24 +1032,60 @@ impl eframe::App for GuiApp {
                                 .size(18.0),
                         );
                     });
-                    ui.label(
-                        eframe::egui::RichText::new("Подключения, обработка и журнал запуска")
-                            .color(eframe::egui::Color32::from_rgb(230, 242, 255)),
-                    );
                 });
-            ui.add_space(8.0);
-            eframe::egui::CollapsingHeader::new("MSSQL")
-                .default_open(true)
-                .show(ui, |ui| {
+            eframe::egui::menu::bar(ui, |ui| {
+                ui.menu_button("Файл", |ui| {
+                    ui.set_min_width(260.0);
+                    if ui.button("Сохранить настройки").clicked() {
+                        if let Err(error) = self.save_settings() {
+                            self.status = format!("Ошибка сохранения: {error:#}");
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Закрыть").clicked() {
+                        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("Подключения", |ui| {
+                    ui.set_min_width(440.0);
+                    ui.label(eframe::egui::RichText::new("MSSQL").strong());
                     text_field(ui, "Сервер", &mut self.settings.sql_server);
                     text_field(ui, "Порт", &mut self.settings.sql_port);
                     text_field(ui, "База", &mut self.settings.sql_database);
                     text_field(ui, "Пользователь", &mut self.settings.sql_user);
                     password_field(ui, "Пароль", &mut self.mssql_password);
+                    ui.separator();
+                    ui.label(eframe::egui::RichText::new("Miranda / XMPP").strong());
+                    text_field(ui, "XMPP-сервер", &mut self.settings.xmpp_server);
+                    text_field(ui, "Порт XMPP", &mut self.settings.xmpp_port);
+                    text_field(ui, "JID учетной записи", &mut self.settings.xmpp_account);
+                    text_field(ui, "XMPP-ресурс", &mut self.settings.xmpp_resource);
+                    text_field(ui, "JID получателя", &mut self.settings.xmpp_recipient);
+                    text_field(
+                        ui,
+                        "JID АТС для звонка",
+                        &mut self.settings.xmpp_call_recipient,
+                    );
+                    password_field(ui, "Пароль XMPP", &mut self.xmpp_password);
+                    ui.separator();
+                    ui.label(eframe::egui::RichText::new("Виртуальный SIP-телефон").strong());
+                    ui.checkbox(
+                        &mut self.settings.sip_enabled,
+                        "Включить виртуальный телефон",
+                    );
+                    text_field(ui, "SIP-сервер АТС", &mut self.settings.sip_server);
+                    text_field(ui, "Порт SIP", &mut self.settings.sip_port);
+                    text_field(ui, "SIP-номер", &mut self.settings.sip_username);
+                    password_field(ui, "SIP Secret", &mut self.sip_password);
+                    ui.checkbox(
+                        &mut self.settings.sip_audio_enabled,
+                        "Проигрывать голосовое сообщение",
+                    );
+                    text_field(ui, "Файл сообщения WAV", &mut self.settings.sip_audio_file);
                 });
-            eframe::egui::CollapsingHeader::new("Фоновый опрос и Miranda/XMPP")
-                .default_open(true)
-                .show(ui, |ui| {
+                ui.menu_button("Заявки", |ui| {
+                    ui.set_min_width(440.0);
+                    ui.label(eframe::egui::RichText::new("Фоновый опрос").strong());
                     ui.checkbox(&mut self.settings.poll_enabled, "Включить фоновый опрос");
                     text_field(
                         ui,
@@ -1061,25 +1097,42 @@ impl eframe::App for GuiApp {
                         "Глубина выборки, дней",
                         &mut self.settings.poll_lookback_days,
                     );
-                    text_field(ui, "XMPP-сервер", &mut self.settings.xmpp_server);
-                    text_field(ui, "Порт XMPP", &mut self.settings.xmpp_port);
-                    text_field(ui, "JID учетной записи", &mut self.settings.xmpp_account);
-                    text_field(
-                        ui,
-                        "XMPP-ресурс (рабочая станция)",
-                        &mut self.settings.xmpp_resource,
+                    ui.separator();
+                    ui.label(eframe::egui::RichText::new("Файлы и аудит").strong());
+                    text_field(ui, "Конфигурация", &mut self.settings.config_path);
+                    text_field(ui, "SQL-запрос", &mut self.settings.query_file);
+                    text_field(ui, "Журнал SQLite", &mut self.settings.audit_db_path);
+                    ui.checkbox(
+                        &mut self.remember_secrets,
+                        "Хранить пароли в Credential Manager",
                     );
-                    text_field(ui, "JID получателя", &mut self.settings.xmpp_recipient);
-                    text_field(
-                        ui,
-                        "JID АТС для звонка",
-                        &mut self.settings.xmpp_call_recipient,
-                    );
-                    password_field(ui, "Пароль XMPP", &mut self.xmpp_password);
-                    ui.label(format!(
-                        "Источник click-to-call: ресурс {} (номер выбирает АТС)",
-                        self.settings.xmpp_resource
-                    ));
+                });
+                ui.menu_button("Отчет", |ui| {
+                    ui.set_min_width(360.0);
+                    ui.label(eframe::egui::RichText::new("Параметры поиска").strong());
+                    text_field(ui, "Дата заявки", &mut self.settings.report_date);
+                    eframe::egui::ComboBox::from_label("Период")
+                        .selected_text(report_period_label(&self.settings.report_period))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.settings.report_period,
+                                "day".to_owned(),
+                                "День",
+                            );
+                            ui.selectable_value(
+                                &mut self.settings.report_period,
+                                "week".to_owned(),
+                                "Неделя",
+                            );
+                        });
+                    if ui.button("Сформировать отчет").clicked() {
+                        self.start_report();
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Действия", |ui| {
+                    ui.set_min_width(380.0);
+                    ui.label(eframe::egui::RichText::new("Опрос и звонки").strong());
                     text_field(
                         ui,
                         "Цель звонка (номер/WS/JID)",
@@ -1115,27 +1168,7 @@ impl eframe::App for GuiApp {
                     {
                         self.start_xmpp_test();
                     }
-                    ui.label("Уведомление отправляется один раз для каждого нового набора заявок.");
-                });
-            eframe::egui::CollapsingHeader::new("Виртуальный SIP-телефон")
-                .default_open(true)
-                .show(ui, |ui| {
-                    ui.checkbox(
-                        &mut self.settings.sip_enabled,
-                        "Включить виртуальный телефон",
-                    );
-                    text_field(ui, "SIP-сервер АТС", &mut self.settings.sip_server);
-                    text_field(ui, "Порт SIP", &mut self.settings.sip_port);
-                    text_field(ui, "SIP-номер", &mut self.settings.sip_username);
-                    password_field(ui, "SIP Secret", &mut self.sip_password);
-                    ui.label("Автоответ включен; используется кодек G.711 A-law (PCMA).");
-                    ui.checkbox(
-                        &mut self.settings.sip_audio_enabled,
-                        "Проигрывать голосовое сообщение",
-                    );
-                    text_field(ui, "Файл сообщения WAV", &mut self.settings.sip_audio_file);
-                    ui.label("Пустой путь = динамическая фраза через локальный Windows TTS.");
-                    ui.label("Для WAV: PCM, 8/16 kHz, 16 бит, mono.");
+                    ui.separator();
                     if ui
                         .add_enabled(
                             self.settings.sip_enabled && !self.sip_password.is_empty(),
@@ -1154,34 +1187,36 @@ impl eframe::App for GuiApp {
                         self.sip_ready = false;
                         self.status = "Остановка виртуального SIP-телефона...".to_owned();
                     }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            !self.running,
+                            eframe::egui::Button::new("Запустить опрос")
+                                .fill(eframe::egui::Color32::from_rgb(0, 120, 212)),
+                        )
+                        .clicked()
+                    {
+                        self.start();
+                    }
+                    if ui
+                        .add_enabled(self.running, eframe::egui::Button::new("Остановить опрос"))
+                        .clicked()
+                    {
+                        self.stop.store(true, Ordering::Relaxed);
+                        self.sip_stop.store(true, Ordering::Relaxed);
+                        self.running = false;
+                        self.sip_running = false;
+                        self.sip_ready = false;
+                        self.status = "Остановка фонового опроса...".to_owned();
+                    }
                 });
-            ui.checkbox(
-                &mut self.remember_secrets,
-                "Хранить пароли в Credential Manager",
-            );
-            if ui
-                .add(
-                    eframe::egui::Button::new("Сохранить настройки")
-                        .fill(eframe::egui::Color32::from_rgb(0, 120, 212)),
-                )
-                .clicked()
-                && let Err(error) = self.save_settings()
-            {
-                self.status = format!("Ошибка сохранения: {error:#}");
-            }
-            eframe::egui::CollapsingHeader::new("Файлы и параметры")
-                .default_open(true)
-                .show(ui, |ui| {
-                    text_field(ui, "Конфигурация", &mut self.settings.config_path);
-                    text_field(ui, "SQL запрос", &mut self.settings.query_file);
-                    text_field(ui, "Журнал SQLite", &mut self.settings.audit_db_path);
-                });
-            eframe::egui::CollapsingHeader::new("Отчет за период")
-                .default_open(true)
-                .show(ui, |ui| {
-                    text_field(ui, "Опорная дата", &mut self.settings.report_date);
-                    eframe::egui::ComboBox::from_label("Период")
-                        .selected_text(&self.settings.report_period)
+            });
+            eframe::egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(eframe::egui::RichText::new("Быстрый отчет").strong());
+                    text_field(ui, "Дата", &mut self.settings.report_date);
+                    eframe::egui::ComboBox::from_id_salt("quick_report_period")
+                        .selected_text(report_period_label(&self.settings.report_period))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.settings.report_period,
@@ -1194,46 +1229,48 @@ impl eframe::App for GuiApp {
                                 "Неделя",
                             );
                         });
-                    if ui
-                        .add(
-                            eframe::egui::Button::new("Сформировать отчет")
-                                .fill(eframe::egui::Color32::from_rgb(0, 120, 212)),
-                        )
-                        .clicked()
-                    {
+                    if ui.button("Сформировать").clicked() {
                         self.start_report();
                     }
                 });
+            });
+        });
+        eframe::egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Состояние OZ");
+            ui.label("Результаты опроса базы данных и выполнения действий");
             ui.separator();
-            if ui
-                .add_enabled(
-                    !self.running,
-                    eframe::egui::Button::new("Запустить опрос")
-                        .fill(eframe::egui::Color32::from_rgb(0, 120, 212)),
-                )
-                .clicked()
-            {
-                self.start();
-            }
-            if ui
-                .add_enabled(self.running, eframe::egui::Button::new("Остановить опрос"))
-                .clicked()
-            {
-                self.stop.store(true, Ordering::Relaxed);
-                self.sip_stop.store(true, Ordering::Relaxed);
-                self.running = false;
-                self.sip_running = false;
-                self.sip_ready = false;
-                self.status = "Остановка фонового опроса...".to_owned();
-            }
-            ui.separator();
-            ui.label("Статус");
+            eframe::egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let state = if self.running {
+                        "Опрос активен"
+                    } else {
+                        "Опрос остановлен"
+                    };
+                    ui.label(eframe::egui::RichText::new(state).strong());
+                    ui.separator();
+                    let sip_state = if self.sip_ready {
+                        "SIP зарегистрирован"
+                    } else {
+                        "SIP не зарегистрирован"
+                    };
+                    ui.label(sip_state);
+                });
+            });
+            ui.add_space(8.0);
+            ui.label("Журнал");
             eframe::egui::ScrollArea::vertical()
-                .max_height(180.0)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.monospace(&self.status);
                 });
         });
+    }
+}
+
+fn report_period_label(period: &str) -> &'static str {
+    match period {
+        "week" => "Неделя",
+        _ => "День",
     }
 }
 
