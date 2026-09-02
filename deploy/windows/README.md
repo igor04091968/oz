@@ -22,6 +22,18 @@ Set Machine-level variables:
 
 Restart the service process after changing environment variables.
 
+## Local voice requirement
+
+If the GUI setting `sip_audio_file` is empty, OZ generates the announcement
+locally through the Windows Speech API. The workstation must have a local
+Russian Windows voice package installed, for example `Microsoft Irina Desktop`:
+
+`Settings -> Time & language -> Speech -> Voices`
+
+Internet access is not required during synthesis or playback. If the Russian
+voice package is unavailable, configure a compatible uncompressed PCM WAV file
+instead (`16-bit`, `mono`, `8` or `16 kHz`).
+
 ## Install With NSSM
 
 ```powershell
