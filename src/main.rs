@@ -1016,9 +1016,28 @@ impl eframe::App for GuiApp {
         }
         ctx.request_repaint_after(Duration::from_millis(250));
         eframe::egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("ОЗ — отслеживание заявок");
-            ui.label("Подключения, параметры обработки и журнал запуска");
-            ui.separator();
+            eframe::egui::Frame::none()
+                .fill(eframe::egui::Color32::from_rgb(0, 120, 212))
+                .inner_margin(eframe::egui::Margin::same(14.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading(
+                            eframe::egui::RichText::new("ОЗ")
+                                .color(eframe::egui::Color32::WHITE)
+                                .strong(),
+                        );
+                        ui.label(
+                            eframe::egui::RichText::new("Отслеживание заявок")
+                                .color(eframe::egui::Color32::WHITE)
+                                .size(18.0),
+                        );
+                    });
+                    ui.label(
+                        eframe::egui::RichText::new("Подключения, обработка и журнал запуска")
+                            .color(eframe::egui::Color32::from_rgb(230, 242, 255)),
+                    );
+                });
+            ui.add_space(8.0);
             eframe::egui::CollapsingHeader::new("MSSQL")
                 .default_open(true)
                 .show(ui, |ui| {
@@ -1140,7 +1159,12 @@ impl eframe::App for GuiApp {
                 &mut self.remember_secrets,
                 "Хранить пароли в Credential Manager",
             );
-            if ui.button("Сохранить настройки").clicked()
+            if ui
+                .add(
+                    eframe::egui::Button::new("Сохранить настройки")
+                        .fill(eframe::egui::Color32::from_rgb(0, 120, 212)),
+                )
+                .clicked()
                 && let Err(error) = self.save_settings()
             {
                 self.status = format!("Ошибка сохранения: {error:#}");
@@ -1170,13 +1194,23 @@ impl eframe::App for GuiApp {
                                 "Неделя",
                             );
                         });
-                    if ui.button("Сформировать отчет").clicked() {
+                    if ui
+                        .add(
+                            eframe::egui::Button::new("Сформировать отчет")
+                                .fill(eframe::egui::Color32::from_rgb(0, 120, 212)),
+                        )
+                        .clicked()
+                    {
                         self.start_report();
                     }
                 });
             ui.separator();
             if ui
-                .add_enabled(!self.running, eframe::egui::Button::new("Запустить опрос"))
+                .add_enabled(
+                    !self.running,
+                    eframe::egui::Button::new("Запустить опрос")
+                        .fill(eframe::egui::Color32::from_rgb(0, 120, 212)),
+                )
                 .clicked()
             {
                 self.start();
