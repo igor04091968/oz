@@ -574,6 +574,8 @@ fn run_gui_poll(
         .lines()
         .find(|line| line.starts_with("OZ_RESULT "))
         .and_then(parse_poll_result);
+    let pending_numbers = parse_pending_numbers(&stdout);
+    let pending_list = format_request_numbers(&pending_numbers);
 
     let mut message = if output.status.success() {
         format!("Проверка завершена.\n{}{}", stdout, stderr)
@@ -585,7 +587,7 @@ fn run_gui_poll(
     // Поэтому один и тот же запрос не создает поток сообщений каждую минуту.
     if let Some((pending, fingerprint)) = result {
         if let Ok(mut current) = announcement_text.lock() {
-            *current = format!("Количество заявок на удаленное подключение: {pending}.");
+            *current = format_pending_announcement(pending, &pending_list);
         }
         if pending == 0 {
             notified_fingerprint.clear();
@@ -593,16 +595,16 @@ fn run_gui_poll(
             if settings.xmpp_recipient.trim().is_empty() {
                 *notified_fingerprint = fingerprint.clone();
                 message = format!(
-                    "OZ_FOCUS\nНайдено необработанных заявок: {pending}. Укажите JID получателя XMPP.\n{message}"
+                    "OZ_FOCUS\nНайдено необработанных заявок: {pending}. Номера: {pending_list}. Укажите JID получателя XMPP.\n{message}"
                 );
             } else if xmpp_password.is_empty() {
                 *notified_fingerprint = fingerprint.clone();
                 message = format!(
-                    "OZ_FOCUS\nНайдено необработанных заявок: {pending}. Укажите пароль XMPP.\n{message}"
+                    "OZ_FOCUS\nНайдено необработанных заявок: {pending}. Номера: {pending_list}. Укажите пароль XMPP.\n{message}"
                 );
             } else {
                 let body = format!(
-                    "ОЗ: обнаружено необработанных заявок: {pending}. Требуется проверка в приложении."
+                    "ОЗ: обнаружено необработанных заявок: {pending}. Номера заявок: {pending_list}. Требуется проверка в приложении."
                 );
                 let xmpp_result = std::thread::Builder::new()
                     .name("oz-xmpp".to_owned())
@@ -630,7 +632,7 @@ fn run_gui_poll(
                     Ok(()) => {
                         *notified_fingerprint = fingerprint;
                         message = format!(
-                            "OZ_FOCUS\nОтправлено уведомление в Miranda. Необработанных заявок: {pending}.\n{message}"
+                            "OZ_FOCUS\nОтправлено уведомление в Miranda. Необработанных заявок: {pending}. Номера: {pending_list}.\n{message}"
                         );
                     }
                     Err(error) => {
@@ -658,6 +660,35 @@ fn parse_poll_result(line: &str) -> Option<(usize, String)> {
         }
     }
     Some((pending?, fingerprint?))
+}
+
+fn parse_pending_numbers(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("OZ_PENDING_NUMS "))
+        .map(|numbers| {
+            numbers
+                .split(',')
+                .map(str::trim)
+                .filter(|number| !number.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn format_request_numbers(numbers: &[String]) -> String {
+    if numbers.is_empty() {
+        "нет".to_owned()
+    } else {
+        numbers.join(", ")
+    }
+}
+
+fn format_pending_announcement(pending: usize, numbers: &str) -> String {
+    format!(
+        "Количество необработанных заявок на удаленное подключение: {pending}. Номера заявок: {numbers}."
+    )
 }
 
 // Блокирующая обертка нужна GUI-потоку: внутри создается короткоживущий Tokio
@@ -1284,7 +1315,9 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     info!(count = requests.len(), "fetched remote work requests");
     let mut pending_requests = Vec::new();
     for request in &requests {
-        if !audit.is_request_processed(&request.request_num)? {
+        // Необработанной считаем именно заявку с неисполненным поручением.
+        // por_neisp из MSSQL является источником истины для этого статуса.
+        if request.por_neisp != 0 && !audit.is_request_processed(&request.request_num)? {
             pending_requests.push(request);
         }
     }
@@ -1299,6 +1332,14 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
         requests.len(),
         pending_requests.len(),
         hash_pending_requests(&pending_fingerprint)
+    );
+    println!(
+        "OZ_PENDING_NUMS {}",
+        pending_requests
+            .iter()
+            .map(|request| request.request_num.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
     );
 
     for request in requests {
@@ -1554,6 +1595,23 @@ mod tests {
     fn poll_result_is_parsed() {
         let result = parse_poll_result("OZ_RESULT fetched=4 pending=2 fingerprint=abc123");
         assert_eq!(result, Some((2, "abc123".to_owned())));
+    }
+
+    #[test]
+    fn pending_numbers_are_parsed_from_poll_output() {
+        let output = "OZ_RESULT fetched=3 pending=2 fingerprint=abc\nOZ_PENDING_NUMS 101, 205";
+        assert_eq!(
+            parse_pending_numbers(output),
+            vec!["101".to_owned(), "205".to_owned()]
+        );
+    }
+
+    #[test]
+    fn pending_announcement_contains_request_numbers() {
+        assert_eq!(
+            format_pending_announcement(2, "101, 205"),
+            "Количество необработанных заявок на удаленное подключение: 2. Номера заявок: 101, 205."
+        );
     }
 
     #[test]
