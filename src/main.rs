@@ -12,9 +12,9 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -195,7 +195,7 @@ impl Default for GuiSettings {
             sip_port: "5060".to_owned(),
             sip_username: "1000".to_owned(),
             sip_audio_enabled: true,
-            sip_audio_file: "call_notice.wav".to_owned(),
+            sip_audio_file: String::new(),
             report_date: "2026-09-01".to_owned(),
             report_period: "day".to_owned(),
         }
@@ -214,6 +214,7 @@ struct GuiApp {
     sip_stop: Arc<AtomicBool>,
     sip_running: bool,
     sip_ready: bool,
+    announcement_text: Arc<Mutex<String>>,
     result_rx: Receiver<String>,
     result_tx: Sender<String>,
 }
@@ -242,6 +243,9 @@ impl GuiApp {
             sip_stop: Arc::new(AtomicBool::new(false)),
             sip_running: false,
             sip_ready: false,
+            announcement_text: Arc::new(Mutex::new(
+                "Количество заявок на удаленное подключение: 0.".to_owned(),
+            )),
             result_rx,
             result_tx,
         }
@@ -262,6 +266,7 @@ impl GuiApp {
         let settings = self.settings.clone();
         let mssql_password = self.mssql_password.clone();
         let xmpp_password = self.xmpp_password.clone();
+        let announcement_text = Arc::clone(&self.announcement_text);
 
         let tx = self.result_tx.clone();
         let config_path = settings.config_path.clone();
@@ -282,6 +287,7 @@ impl GuiApp {
                     &mssql_password,
                     &xmpp_password,
                     &mut notified_fingerprint,
+                    &announcement_text,
                 );
                 let _ = tx.send(message);
                 if !settings.poll_enabled {
@@ -332,6 +338,7 @@ impl GuiApp {
         let password = self.sip_password.clone();
         let audio_enabled = self.settings.sip_audio_enabled;
         let audio_file = self.settings.sip_audio_file.trim().to_owned();
+        let announcement_text = Arc::clone(&self.announcement_text);
         if server.is_empty() || username.is_empty() || password.is_empty() {
             self.status = "SIP не запущен: заполните сервер, номер и Secret".to_owned();
             return;
@@ -356,7 +363,22 @@ impl GuiApp {
                 // Callback регистрируется до автоответа: xphone вызовет его
                 // после согласования SDP и готовности RTP-медиаканала.
                 if audio_enabled {
-                    match load_pcm_wav(&audio_file) {
+                    let announcement = announcement_text
+                        .lock()
+                        .map(|value| value.clone())
+                        .unwrap_or_else(|_| {
+                            "Количество заявок на удаленное подключение: 0.".to_owned()
+                        });
+                    let audio_result = if audio_file.is_empty() || audio_file == "auto" {
+                        synthesize_speech_wav(&announcement).and_then(|path| {
+                            let result = load_pcm_wav(&path);
+                            let _ = fs::remove_file(path);
+                            result
+                        })
+                    } else {
+                        load_pcm_wav(&audio_file)
+                    };
+                    match audio_result {
                         Ok(samples) => {
                             let weak_call = Arc::downgrade(&call);
                             let file_name = audio_file.clone();
@@ -529,6 +551,7 @@ fn run_gui_poll(
     mssql_password: &str,
     xmpp_password: &str,
     notified_fingerprint: &mut String,
+    announcement_text: &Arc<Mutex<String>>,
 ) -> String {
     // GUI запускает тот же process-requests, что и CLI, поэтому ручная проверка
     // и фоновый опрос используют один и тот же код получения данных.
@@ -561,6 +584,9 @@ fn run_gui_poll(
     // Уведомление отправляется только при изменении набора необработанных заявок.
     // Поэтому один и тот же запрос не создает поток сообщений каждую минуту.
     if let Some((pending, fingerprint)) = result {
+        if let Ok(mut current) = announcement_text.lock() {
+            *current = format!("Количество заявок на удаленное подключение: {pending}.");
+        }
         if pending == 0 {
             notified_fingerprint.clear();
         } else if fingerprint != *notified_fingerprint {
@@ -813,8 +839,10 @@ fn xml_escape(value: &str) -> String {
 
 // Читаем только несжатый PCM WAV: файл можно подготовить заранее без
 // внешнего медиасервера и без передачи текста сообщения облачному TTS.
-fn load_pcm_wav(path: &str) -> Result<Vec<i16>> {
-    let data = fs::read(path).with_context(|| format!("не удалось прочитать WAV: {path}"))?;
+fn load_pcm_wav(path: impl AsRef<std::path::Path>) -> Result<Vec<i16>> {
+    let path = path.as_ref();
+    let data =
+        fs::read(path).with_context(|| format!("не удалось прочитать WAV: {}", path.display()))?;
     if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
         bail!("файл не является WAV RIFF");
     }
@@ -866,6 +894,44 @@ fn load_pcm_wav(path: &str) -> Result<Vec<i16>> {
         bail!("WAV не содержит сэмплов");
     }
     Ok(samples)
+}
+
+// Генерируем короткое объявление локальным Windows Speech API. Текст содержит
+// только число заявок и служебную фразу, поэтому не уходит провайдеру TTS.
+fn synthesize_speech_wav(text: &str) -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let path =
+            std::env::temp_dir().join(format!("oz-voice-{}-{stamp}.wav", std::process::id()));
+        let encode = |value: &str| base64::engine::general_purpose::STANDARD.encode(value);
+        let output = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Add-Type -AssemblyName System.Speech; $t=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:OZ_TTS_TEXT)); $p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:OZ_TTS_PATH)); $s=New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile($p); $s.Speak($t); $s.Dispose()",
+            ])
+            .env("OZ_TTS_TEXT", encode(text))
+            .env("OZ_TTS_PATH", encode(&path.to_string_lossy()))
+            .output()
+            .context("запуск локального Windows Speech API")?;
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            bail!("Windows Speech API завершился с ошибкой: {error}");
+        }
+        Ok(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        bail!("локальный TTS для динамического сообщения доступен в Windows-сборке")
+    }
 }
 
 fn resample_pcm(samples: &[i16], input_rate: u32) -> Result<Vec<i16>> {
@@ -999,7 +1065,8 @@ impl eframe::App for GuiApp {
                         "Проигрывать голосовое сообщение",
                     );
                     text_field(ui, "Файл сообщения WAV", &mut self.settings.sip_audio_file);
-                    ui.label("Формат: PCM, 8/16 kHz, 16 бит, mono.");
+                    ui.label("Пустой путь = динамическая фраза через локальный Windows TTS.");
+                    ui.label("Для WAV: PCM, 8/16 kHz, 16 бит, mono.");
                     if ui
                         .add_enabled(
                             self.settings.sip_enabled && !self.sip_password.is_empty(),
