@@ -168,6 +168,7 @@ struct GuiSettings {
     xmpp_call_recipient: String,
     xmpp_caller_extension: String,
     call_target: String,
+    auto_call_on_pending: bool,
     sip_enabled: bool,
     sip_server: String,
     sip_port: String,
@@ -202,6 +203,7 @@ impl Default for GuiSettings {
             xmpp_call_recipient: "pbx@dns.sevnb.ru".to_owned(),
             xmpp_caller_extension: "1000".to_owned(),
             call_target: String::new(),
+            auto_call_on_pending: true,
             sip_enabled: true,
             sip_server: "10.33.1.82".to_owned(),
             sip_port: "5060".to_owned(),
@@ -686,10 +688,37 @@ fn run_gui_poll(
                 match xmpp_result {
                     Ok(()) => {
                         *notified_fingerprint = fingerprint;
-                        message = format!(
+                        let mut actions = format!(
                             "OZ_FOCUS\nОтправлено уведомление в Miranda. {}\n{message}",
                             format_pending_announcement(pending, &pending_list)
                         );
+                        if settings.auto_call_on_pending {
+                            let target = settings.call_target.trim();
+                            if target.is_empty() {
+                                actions
+                                    .push_str("\nАвтодозвон не выполнен: не указана цель звонка.");
+                            } else if let Err(error) = validate_call_target(target) {
+                                actions.push_str(&format!("\nАвтодозвон не выполнен: {error}."));
+                            } else {
+                                let call_result = send_xmpp_call_blocking(
+                                    &settings.xmpp_server,
+                                    &settings.xmpp_port,
+                                    &settings.xmpp_account,
+                                    &settings.xmpp_resource,
+                                    xmpp_password,
+                                    &settings.xmpp_call_recipient,
+                                    target,
+                                );
+                                match call_result {
+                                    Ok(()) => actions
+                                        .push_str(&format!("\nАвтодозвон отправлен на {target}.")),
+                                    Err(error) => actions.push_str(&format!(
+                                        "\nАвтодозвон не отправлен: {error:#}."
+                                    )),
+                                }
+                            }
+                        }
+                        message = actions;
                     }
                     Err(error) => {
                         *notified_fingerprint = fingerprint.clone();
@@ -1201,6 +1230,10 @@ impl eframe::App for GuiApp {
                         ui,
                         "Цель звонка (номер/WS/JID)",
                         &mut self.settings.call_target,
+                    );
+                    ui.checkbox(
+                        &mut self.settings.auto_call_on_pending,
+                        "Автодозвон при новой заявке",
                     );
                     if ui
                         .add_enabled(
@@ -1948,6 +1981,11 @@ mod tests {
         assert!(validate_call_target("").is_err());
         assert!(validate_call_target("WS-GST01\n").is_err());
         assert!(validate_call_target("135").is_ok());
+    }
+
+    #[test]
+    fn gui_defaults_to_auto_call_for_new_pending_requests() {
+        assert!(GuiSettings::default().auto_call_on_pending);
     }
 
     #[test]
