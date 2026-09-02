@@ -1308,7 +1308,8 @@ fn run_gui() -> Result<()> {
     eframe::run_native(
         "ОЗ — отслеживание заявок",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
+            apply_microsoft_style(&cc.egui_ctx);
             let mut app = GuiApp::new();
             if app.settings.poll_enabled {
                 app.start();
@@ -1317,6 +1318,29 @@ fn run_gui() -> Result<()> {
         }),
     )
     .map_err(|error| anyhow::anyhow!("GUI failed: {error}"))
+}
+
+// Сдержанная светлая тема в духе стандартных приложений Windows: белая рабочая
+// область, серые служебные поверхности и синий цвет системного акцента.
+fn apply_microsoft_style(ctx: &eframe::egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = eframe::egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = eframe::egui::vec2(12.0, 6.0);
+    style.spacing.interact_size.y = 28.0;
+
+    let mut visuals = eframe::egui::Visuals::light();
+    visuals.window_fill = eframe::egui::Color32::from_rgb(255, 255, 255);
+    visuals.panel_fill = eframe::egui::Color32::from_rgb(250, 250, 250);
+    visuals.faint_bg_color = eframe::egui::Color32::from_rgb(243, 243, 243);
+    visuals.extreme_bg_color = eframe::egui::Color32::from_rgb(255, 255, 255);
+    visuals.selection.bg_fill = eframe::egui::Color32::from_rgb(0, 120, 212);
+    visuals.selection.stroke.color = eframe::egui::Color32::from_rgb(0, 90, 158);
+    visuals.hyperlink_color = eframe::egui::Color32::from_rgb(0, 103, 192);
+    visuals.widgets.inactive.bg_fill = eframe::egui::Color32::from_rgb(246, 246, 246);
+    visuals.widgets.hovered.bg_fill = eframe::egui::Color32::from_rgb(232, 240, 254);
+    visuals.widgets.active.bg_fill = eframe::egui::Color32::from_rgb(204, 228, 247);
+    style.visuals = visuals;
+    ctx.set_style(style);
 }
 
 fn load_config(path: &str) -> Result<AppConfig> {
