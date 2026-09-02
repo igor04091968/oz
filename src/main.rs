@@ -1570,6 +1570,12 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
             .collect::<Vec<_>>()
             .join(",")
     );
+    for request in &pending_requests {
+        println!(
+            "OZ_PENDING_REQUEST num={} requester={}",
+            request.request_num, request.requester
+        );
+    }
 
     for request in requests {
         if audit.is_request_processed(&request.request_num)? {
@@ -1631,7 +1637,7 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
             waiting += 1;
             "waiting"
         };
-        rows.push((request.request_num, status));
+        rows.push((request.request_num, request.requester, status));
     }
 
     println!(
@@ -1645,8 +1651,11 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
         processed,
         waiting
     );
-    for (number, status) in rows {
-        println!("OZ_REQUEST num={} status={status}", number);
+    for (number, requester, status) in rows {
+        println!(
+            "OZ_REQUEST num={} requester={} status={status}",
+            number, requester
+        );
     }
     Ok(())
 }
