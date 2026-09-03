@@ -578,7 +578,8 @@ impl GuiApp {
             );
             let message = match command.output() {
                 Ok(output) if output.status.success() => {
-                    String::from_utf8_lossy(&output.stdout).into_owned()
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    format_quick_report(&stdout).unwrap_or_else(|| stdout.into_owned())
                 }
                 Ok(output) => format!(
                     "Ошибка отчета ({}):\n{}{}",
@@ -1373,6 +1374,42 @@ fn report_period_label(period: &str) -> &'static str {
     }
 }
 
+fn format_quick_report(output: &str) -> Option<String> {
+    let report_line = output.lines().find(|line| line.starts_with("OZ_REPORT "))?;
+    let processed = report_line
+        .split_whitespace()
+        .find_map(|item| item.strip_prefix("processed=")?.parse::<usize>().ok())?;
+    let mut entries = Vec::new();
+
+    for line in output
+        .lines()
+        .filter(|line| line.starts_with("OZ_REQUEST "))
+    {
+        let Some(fields) = line.strip_prefix("OZ_REQUEST ") else {
+            continue;
+        };
+        let Some((number, rest)) = fields.split_once(" requester=") else {
+            continue;
+        };
+        let Some(requester) = rest.strip_suffix(" status=processed") else {
+            continue;
+        };
+        let number = number.trim().strip_prefix("num=").unwrap_or(number.trim());
+        if !number.is_empty() && !requester.trim().is_empty() {
+            entries.push(format!("№ {number} — {}", requester.trim()));
+        }
+    }
+
+    let mut report = format!("Быстрый отчет\nОбработано заявок: {processed}\n");
+    if entries.is_empty() {
+        report.push_str("Обработанные заявки: нет");
+    } else {
+        report.push_str("Обработанные заявки:\n");
+        report.push_str(&entries.join("\n"));
+    }
+    Some(report)
+}
+
 fn text_field(ui: &mut eframe::egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -1980,6 +2017,33 @@ mod tests {
     fn report_date_format_is_checked() {
         assert!(validate_report_date("2026-09-01").is_ok());
         assert!(validate_report_date("20260901").is_err());
+    }
+
+    #[test]
+    fn quick_report_shows_processed_count_numbers_and_requesters() {
+        let output = concat!(
+            "OZ_REPORT period=day anchor_date=2026-09-01 total=3 processed=2 waiting=1\n",
+            "OZ_REQUEST num=101 requester=Иванов status=processed\n",
+            "OZ_REQUEST num=205 requester=Петров status=waiting\n",
+            "OZ_REQUEST num=309 requester=Сидоров status=processed\n",
+        );
+
+        assert_eq!(
+            format_quick_report(output).as_deref(),
+            Some(
+                "Быстрый отчет\nОбработано заявок: 2\nОбработанные заявки:\n№ 101 — Иванов\n№ 309 — Сидоров"
+            )
+        );
+    }
+
+    #[test]
+    fn quick_report_handles_no_processed_requests() {
+        let output = "OZ_REPORT period=day anchor_date=2026-09-01 total=1 processed=0 waiting=1\n";
+
+        assert_eq!(
+            format_quick_report(output).as_deref(),
+            Some("Быстрый отчет\nОбработано заявок: 0\nОбработанные заявки: нет")
+        );
     }
 
     #[test]
