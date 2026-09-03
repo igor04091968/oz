@@ -1939,18 +1939,68 @@ impl PfsenseClient {
         {
             bail!("интерфейс правил pfSense содержит недопустимые символы");
         }
-        let rules = self.get_json(&format!("firewall/rules?interface={rules_interface}"))?;
+        let rules = self.get_json(&format!(
+            "firewall/rules?interface__contains={rules_interface}&limit=100"
+        ))?;
+        let schedules = self.get_json("firewall/schedules?limit=100")?;
         let version_text = version
             .pointer("/data/version")
             .or_else(|| version.pointer("/data"))
             .map(|value| value.to_string())
             .unwrap_or_else(|| "версия не указана".to_owned());
-        let rule_count = rules
+        let active_schedules: std::collections::HashSet<&str> = schedules
             .pointer("/data")
             .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
+            .into_iter()
+            .flatten()
+            .filter(|schedule| {
+                schedule.get("active").and_then(serde_json::Value::as_bool) == Some(true)
+            })
+            .filter_map(|schedule| schedule.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        let active_rules: Vec<&serde_json::Value> = rules
+            .pointer("/data")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|rule| rule.get("disabled").and_then(serde_json::Value::as_bool) != Some(true))
+            .filter(|rule| rule.get("type").and_then(serde_json::Value::as_str) == Some("pass"))
+            .filter(|rule| {
+                rule.get("sched")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|schedule| active_schedules.contains(schedule))
+            })
+            .collect();
+        let rule_lines = active_rules
+            .iter()
+            .map(|rule| {
+                let description = rule
+                    .get("descr")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("без описания");
+                let source = rule
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let destination = rule
+                    .get("destination")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let schedule = rule
+                    .get("sched")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                format!("{description} [{source} -> {destination}; расписание: {schedule}]")
+            })
+            .collect::<Vec<_>>();
         Ok(format!(
-            "версия API: {version_text}; правил firewall ({rules_interface}): {rule_count}"
+            "версия API: {version_text}; активных правил firewall ({rules_interface}): {}{}",
+            active_rules.len(),
+            if rule_lines.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", rule_lines.join("; "))
+            }
         ))
     }
 }
