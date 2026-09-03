@@ -1155,7 +1155,9 @@ impl eframe::App for GuiApp {
                         "Проигрывать голосовое сообщение",
                     );
                     text_field(ui, "Файл сообщения WAV", &mut self.settings.sip_audio_file);
-                    ui.separator();
+                });
+                ui.menu_button("pfSense", |ui| {
+                    ui.set_min_width(440.0);
                     ui.label(eframe::egui::RichText::new("pfSense REST API v2").strong());
                     ui.checkbox(&mut self.settings.pfsense_enabled, "Включить интеграцию");
                     text_field(ui, "URL pfSense", &mut self.settings.pfsense_url);
