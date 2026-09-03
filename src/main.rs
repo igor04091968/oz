@@ -1099,18 +1099,21 @@ async fn wait_for_xmpp_bridge(
     read_xmpp_until(&mut stream, "oz-events-bind-1", "XMPP listener bind").await?;
     stream.write_all(b"<presence/>").await?;
     let mut buffer = [0_u8; 4096];
+    let mut stanza_buffer = String::new();
     while !stop.load(Ordering::Relaxed) {
-        let read = tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buffer))
-            .await
-            .context("XMPP listener read timeout")??;
+        let read =
+            match tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buffer)).await {
+                Ok(result) => result?,
+                Err(_) => return Ok(()),
+            };
         if read == 0 {
             bail!("XMPP listener connection closed");
         }
-        let stanza = String::from_utf8_lossy(&buffer[..read]);
-        if stanza.contains("OZ_CALL_BRIDGED") {
+        stanza_buffer.push_str(&String::from_utf8_lossy(&buffer[..read]));
+        if stanza_buffer.contains("OZ_CALL_BRIDGED") {
             bridge_ready.store(true, Ordering::Release);
             let _ = tx.send("OZ_FOCUS\nАТС подтвердила подключение абонента к bridge.".to_owned());
-            return Ok(());
+            stanza_buffer.clear();
         }
     }
     Ok(())
