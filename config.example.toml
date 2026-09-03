@@ -14,6 +14,6 @@ poll_lookback_days = 30
 [pfsense]
 base_url = "https://10.35.0.1"
 api_key_env = "OZ_PFSENSE_API_KEY"
-timeout_seconds = 15
+timeout_seconds = 60
 ca_cert_path = ""
 skip_tls_verify = false

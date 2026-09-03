@@ -216,7 +216,7 @@ impl Default for GuiSettings {
             report_period: "day".to_owned(),
             pfsense_enabled: false,
             pfsense_url: "https://10.35.0.1".to_owned(),
-            pfsense_timeout_seconds: "15".to_owned(),
+            pfsense_timeout_seconds: "60".to_owned(),
             pfsense_ca_cert_path: String::new(),
             pfsense_skip_tls_verify: false,
         }
@@ -1541,8 +1541,8 @@ skip_tls_verify = {}
         settings
             .pfsense_timeout_seconds
             .parse::<u64>()
-            .unwrap_or(15)
-            .clamp(5, 120),
+            .unwrap_or(60)
+            .clamp(5, 300),
         settings.pfsense_ca_cert_path,
         settings.pfsense_skip_tls_verify
     );
@@ -1874,7 +1874,7 @@ impl PfsenseClient {
             bail!("URL pfSense должен начинаться с http:// или https://");
         }
         let mut builder = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(timeout_seconds.clamp(5, 120)));
+            .timeout(Duration::from_secs(timeout_seconds.clamp(5, 300)));
         if !ca_cert_path.trim().is_empty() {
             let certificate_bytes = fs::read(ca_cert_path)
                 .with_context(|| format!("чтение CA-сертификата pfSense: {ca_cert_path}"))?;
@@ -1909,7 +1909,7 @@ impl PfsenseClient {
             .get(url)
             .header("X-API-Key", &self.api_key)
             .send()
-            .context("запрос к pfSense REST API v2")?;
+            .with_context(|| format!("запрос к pfSense REST API v2 ({path})"))?;
         let status = response.status();
         if !status.is_success() {
             bail!("pfSense API вернул HTTP {status}");
