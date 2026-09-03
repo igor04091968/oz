@@ -466,8 +466,14 @@ impl GuiApp {
                                     if let Some(call) = weak_call.upgrade()
                                         && let Some(writer) = call.pcm_writer()
                                     {
-                                        write_sip_diagnostic("SIP_PCM_WRITER_ACQUIRED");
-                                        let _ = media_tx.send("SIP_PCM_WRITER_ACQUIRED".to_owned());
+                                        let transport = format!(
+                                            "SIP_PCM_WRITER_ACQUIRED remote={}:{} active={}",
+                                            call.remote_ip(),
+                                            call.remote_port(),
+                                            call.media_session_active()
+                                        );
+                                        write_sip_diagnostic(&transport);
+                                        let _ = media_tx.send(transport);
                                         const PCMA_FRAME_SAMPLES: usize = 160;
                                         let mut sent_frames = 0usize;
                                         for chunk in samples.chunks(PCMA_FRAME_SAMPLES) {
