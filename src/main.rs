@@ -115,6 +115,7 @@ struct RemoteWorkRequest {
 }
 
 const PFSENSE_CACHE_TTL_SECONDS: u64 = 3600;
+const SIP_ANNOUNCEMENT_DELAY_SECONDS: u64 = 5;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct PfsenseRuleCache {
@@ -429,13 +430,41 @@ impl GuiApp {
                         Ok(samples) => {
                             let weak_call = Arc::downgrade(&call);
                             let file_name = audio_file.clone();
+                            let samples = Arc::new(samples);
                             call.on_media(move || {
-                                if let Some(call) = weak_call.upgrade()
-                                    && let Some(writer) = call.paced_pcm_writer()
-                                {
-                                    let _ = writer.send(samples.clone());
-                                    info!(file = %file_name, "SIP voice message playback started");
-                                }
+                                let weak_call = weak_call.clone();
+                                let file_name = file_name.clone();
+                                let samples = Arc::clone(&samples);
+                                thread::spawn(move || {
+                                    // АТС сначала отвечает на виртуальный номер 1000,
+                                    // затем дозванивается до целевого абонента и только
+                                    // после этого создает bridge. Немедленная передача
+                                    // RTP попадает в первый leg и до абонента не доходит.
+                                    thread::sleep(Duration::from_secs(
+                                        SIP_ANNOUNCEMENT_DELAY_SECONDS,
+                                    ));
+                                    if let Some(call) = weak_call.upgrade()
+                                        && let Some(writer) = call.paced_pcm_writer()
+                                    {
+                                        match writer.send((*samples).clone()) {
+                                            Ok(()) => info!(
+                                                file = %file_name,
+                                                delay_seconds = SIP_ANNOUNCEMENT_DELAY_SECONDS,
+                                                "SIP voice message playback started"
+                                            ),
+                                            Err(error) => warn!(
+                                                file = %file_name,
+                                                error = %error,
+                                                "SIP voice message playback failed"
+                                            ),
+                                        }
+                                    } else {
+                                        warn!(
+                                            file = %file_name,
+                                            "SIP voice message playback skipped: call media is unavailable"
+                                        );
+                                    }
+                                });
                             });
                         }
                         Err(error) => {
