@@ -1939,30 +1939,31 @@ impl PfsenseClient {
         {
             bail!("интерфейс правил pfSense содержит недопустимые символы");
         }
-        let rules = self.get_json(&format!(
-            "firewall/rules?interface__contains={rules_interface}&limit=100"
-        ))?;
-        let schedules = self.get_json("firewall/schedules?limit=100")?;
+        let rules = self.get_paginated_array("firewall/rules")?;
+        let schedules = self.get_paginated_array("firewall/schedules")?;
         let version_text = version
             .pointer("/data/version")
             .or_else(|| version.pointer("/data"))
             .map(|value| value.to_string())
             .unwrap_or_else(|| "версия не указана".to_owned());
         let active_schedules: std::collections::HashSet<&str> = schedules
-            .pointer("/data")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
+            .iter()
             .filter(|schedule| {
                 schedule.get("active").and_then(serde_json::Value::as_bool) == Some(true)
             })
             .filter_map(|schedule| schedule.get("name").and_then(serde_json::Value::as_str))
             .collect();
         let active_rules: Vec<&serde_json::Value> = rules
-            .pointer("/data")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
+            .iter()
+            .filter(|rule| {
+                rule.get("interface")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|interfaces| {
+                        interfaces
+                            .iter()
+                            .any(|interface| interface.as_str() == Some(rules_interface))
+                    })
+            })
             .filter(|rule| rule.get("disabled").and_then(serde_json::Value::as_bool) != Some(true))
             .filter(|rule| rule.get("type").and_then(serde_json::Value::as_str) == Some("pass"))
             .filter(|rule| {
@@ -2002,6 +2003,27 @@ impl PfsenseClient {
                 format!("; {}", rule_lines.join("; "))
             }
         ))
+    }
+
+    fn get_paginated_array(&self, path: &str) -> Result<Vec<serde_json::Value>> {
+        const PAGE_SIZE: usize = 1;
+        const MAX_PAGES: usize = 1000;
+        let mut items = Vec::new();
+        for page in 0..MAX_PAGES {
+            let response = self.get_json(&format!(
+                "{path}?limit={PAGE_SIZE}&offset={}",
+                page * PAGE_SIZE
+            ))?;
+            let data = response
+                .pointer("/data")
+                .and_then(serde_json::Value::as_array)
+                .with_context(|| format!("pfSense API endpoint {path} не вернул массив data"))?;
+            if data.is_empty() {
+                return Ok(items);
+            }
+            items.extend(data.iter().cloned());
+        }
+        bail!("pfSense API endpoint {path}: превышено ограничение страниц ({MAX_PAGES})")
     }
 }
 
