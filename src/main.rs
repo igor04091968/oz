@@ -530,6 +530,8 @@ impl GuiApp {
         let rules_interface = self.settings.pfsense_rules_interface.trim().to_owned();
         let ca_cert_path = self.settings.pfsense_ca_cert_path.trim().to_owned();
         let skip_tls_verify = self.settings.pfsense_skip_tls_verify;
+        let sql_settings = self.settings.clone();
+        let mssql_password = self.mssql_password.clone();
         let tx = self.result_tx.clone();
         if !self.settings.pfsense_enabled {
             self.status = "pfSense API: включите интеграцию в настройках.".to_owned();
@@ -543,6 +545,7 @@ impl GuiApp {
         }
         self.status = "Проверка pfSense REST API v2...".to_owned();
         thread::spawn(move || {
+            let sql_requests = fetch_gui_requests(&sql_settings, &mssql_password).ok();
             let message = match PfsenseClient::new(
                 &base_url,
                 &api_key,
@@ -550,7 +553,7 @@ impl GuiApp {
                 &ca_cert_path,
                 skip_tls_verify,
             )
-            .and_then(|client| client.health_check(&rules_interface))
+            .and_then(|client| client.health_check(&rules_interface, sql_requests.as_deref()))
             {
                 Ok(summary) => format!("OZ_FOCUS\npfSense REST API v2 доступен. {summary}"),
                 Err(error) => format!("pfSense REST API v2: проверка не пройдена: {error:#}"),
@@ -1503,6 +1506,23 @@ fn build_connection_string(settings: &GuiSettings, password: &str) -> String {
     )
 }
 
+fn fetch_gui_requests(settings: &GuiSettings, password: &str) -> Result<Vec<RemoteWorkRequest>> {
+    let query = fs::read_to_string(&settings.query_file)
+        .with_context(|| format!("read request query file {}", settings.query_file))?;
+    let query = query_for_poll_lookback(
+        &query,
+        settings
+            .poll_lookback_days
+            .parse::<u32>()
+            .unwrap_or(default_poll_lookback_days()),
+    )?;
+    let config = SqlConfig {
+        connection_string_env: "MSSQL_CONNECTION_STRING".to_owned(),
+        default_connection_string: Some(build_connection_string(settings, password)),
+    };
+    tokio::runtime::Runtime::new()?.block_on(fetch_remote_work_requests(&config, &query))
+}
+
 // Генерируем минимальный runtime config для дочернего process-requests.
 // Пароль MSSQL передается ему только через environment.
 fn write_runtime_config(settings: &GuiSettings) -> Result<()> {
@@ -1929,7 +1949,11 @@ impl PfsenseClient {
             .context("разбор ответа pfSense API")
     }
 
-    fn health_check(&self, rules_interface: &str) -> Result<String> {
+    fn health_check(
+        &self,
+        rules_interface: &str,
+        sql_requests: Option<&[RemoteWorkRequest]>,
+    ) -> Result<String> {
         let version = self.get_json("system/restapi/version")?;
         let rules_interface = rules_interface.trim();
         if rules_interface.is_empty()
@@ -1991,7 +2015,28 @@ impl PfsenseClient {
                     .get("sched")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("?");
-                format!("{description} [{source} -> {destination}; расписание: {schedule}]")
+                let rule_key = pfsense_rule_key(description);
+                let access = sql_requests
+                    .map(|requests| {
+                        let matched = requests
+                            .iter()
+                            .filter(|request| {
+                                normalized_requester_key(&request.requester).is_some_and(|key| {
+                                    rule_key == key || rule_key.starts_with(&format!("{key}_"))
+                                })
+                            })
+                            .map(|request| request.requester.as_str())
+                            .collect::<Vec<_>>();
+                        if matched.is_empty() {
+                            "доступ: пользователь из SQL не найден".to_owned()
+                        } else {
+                            format!("доступ: {}", matched.join(", "))
+                        }
+                    })
+                    .unwrap_or_else(|| "доступ: SQL не проверен".to_owned());
+                format!(
+                    "{description} [{source} -> {destination}; расписание: {schedule}; {access}]"
+                )
             })
             .collect::<Vec<_>>();
         Ok(format!(
@@ -2035,6 +2080,73 @@ fn remote_work_request_from_row(row: tiberius::Row) -> Result<RemoteWorkRequest>
         requester: get_required_str(&row, "ot_kogo")?,
         por_neisp: row.get::<i32, _>("por_neisp").unwrap_or(1),
     })
+}
+
+fn normalized_requester_key(value: &str) -> Option<String> {
+    let transliterated: String = value.chars().map(transliterate_char).collect();
+    let words: Vec<String> = transliterated
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    let surname = words.first()?.clone();
+    let initials: String = words
+        .iter()
+        .skip(1)
+        .filter_map(|word| word.chars().next())
+        .collect();
+    if initials.is_empty() {
+        Some(surname)
+    } else {
+        Some(format!("{surname}_{initials}"))
+    }
+}
+
+fn transliterate_char(character: char) -> String {
+    match character.to_lowercase().next().unwrap_or(character) {
+        'а' => "a",
+        'б' => "b",
+        'в' => "v",
+        'г' => "g",
+        'д' => "d",
+        'е' | 'ё' => "e",
+        'ж' => "zh",
+        'з' => "z",
+        'и' => "i",
+        'й' => "j",
+        'к' => "k",
+        'л' => "l",
+        'м' => "m",
+        'н' => "n",
+        'о' => "o",
+        'п' => "p",
+        'р' => "r",
+        'с' => "s",
+        'т' => "t",
+        'у' => "u",
+        'ф' => "f",
+        'х' => "kh",
+        'ц' => "ts",
+        'ч' => "ch",
+        'ш' => "sh",
+        'щ' => "shch",
+        'ъ' | 'ь' => "",
+        'ы' => "y",
+        'э' => "e",
+        'ю' => "yu",
+        'я' => "ya",
+        character if character.is_ascii_alphanumeric() => return character.to_string(),
+        _ => " ",
+    }
+    .to_owned()
+}
+
+fn pfsense_rule_key(description: &str) -> String {
+    description
+        .split([',', ' ', ';'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn get_required_str(row: &tiberius::Row, name: &str) -> Result<String> {
@@ -2231,5 +2343,13 @@ mod tests {
         assert!(PfsenseClient::new("10.35.0.1", "test", 15, "", false).is_err());
         assert!(PfsenseClient::new("https://10.35.0.1", "test", 15, "", false).is_ok());
         assert!(PfsenseClient::new("https://10.35.0.1", "test", 15, "", true).is_ok());
+    }
+
+    #[test]
+    fn requester_names_match_pfsense_login_prefixes() {
+        let requester = normalized_requester_key("Рачков Илья Игоревич").unwrap();
+        let rule_key = pfsense_rule_key("rachkov_ii_syk83, Приказ №25-132");
+        assert_eq!(requester, "rachkov_ii");
+        assert!(rule_key == requester || rule_key.starts_with(&format!("{requester}_")));
     }
 }
