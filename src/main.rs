@@ -1921,18 +1921,22 @@ impl PfsenseClient {
 
     fn health_check(&self) -> Result<String> {
         let version = self.get_json("system/restapi/version")?;
-        let rules = self.get_json("firewall/rules")?;
+        // Полный список правил может быть большим и на pfSense отвечать слишком
+        // долго. Для health-check достаточно проверить endpoint с одной записью.
+        let rules = self.get_json("firewall/rules?limit=1")?;
         let version_text = version
             .pointer("/data/version")
             .or_else(|| version.pointer("/data"))
             .map(|value| value.to_string())
             .unwrap_or_else(|| "версия не указана".to_owned());
-        let rule_count = rules
-            .pointer("/data")
-            .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
+        let rules_endpoint_available = rules.pointer("/data").is_some();
         Ok(format!(
-            "версия API: {version_text}; правил firewall: {rule_count}"
+            "версия API: {version_text}; endpoint firewall/rules: {}",
+            if rules_endpoint_available {
+                "доступен"
+            } else {
+                "ответ получен"
+            }
         ))
     }
 }
