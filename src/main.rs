@@ -180,6 +180,7 @@ struct GuiSettings {
     pfsense_enabled: bool,
     pfsense_url: String,
     pfsense_timeout_seconds: String,
+    pfsense_ca_cert_path: String,
 }
 
 impl Default for GuiSettings {
@@ -215,6 +216,7 @@ impl Default for GuiSettings {
             pfsense_enabled: false,
             pfsense_url: "https://10.35.0.1".to_owned(),
             pfsense_timeout_seconds: "15".to_owned(),
+            pfsense_ca_cert_path: String::new(),
         }
     }
 }
@@ -521,6 +523,7 @@ impl GuiApp {
             .unwrap_or(15)
             .clamp(5, 120);
         let api_key = self.pfsense_api_key.clone();
+        let ca_cert_path = self.settings.pfsense_ca_cert_path.trim().to_owned();
         let tx = self.result_tx.clone();
         if !self.settings.pfsense_enabled {
             self.status = "pfSense API: включите интеграцию в настройках.".to_owned();
@@ -534,7 +537,7 @@ impl GuiApp {
         }
         self.status = "Проверка pfSense REST API v2...".to_owned();
         thread::spawn(move || {
-            let message = match PfsenseClient::new(&base_url, &api_key, timeout)
+            let message = match PfsenseClient::new(&base_url, &api_key, timeout, &ca_cert_path)
                 .and_then(|client| client.health_check())
             {
                 Ok(summary) => format!("OZ_FOCUS\npfSense REST API v2 доступен. {summary}"),
@@ -1167,6 +1170,11 @@ impl eframe::App for GuiApp {
                         "Таймаут, секунд",
                         &mut self.settings.pfsense_timeout_seconds,
                     );
+                    text_field(
+                        ui,
+                        "CA-сертификат pfSense",
+                        &mut self.settings.pfsense_ca_cert_path,
+                    );
                     password_field(ui, "API-ключ", &mut self.pfsense_api_key);
                     if ui
                         .add_enabled(
@@ -1495,6 +1503,7 @@ poll_lookback_days = {}
 base_url = {:?}
 api_key_env = "OZ_PFSENSE_API_KEY"
 timeout_seconds = {}
+ca_cert_path = {:?}
 "#,
         interval_seconds,
         settings.audit_db_path,
@@ -1513,7 +1522,8 @@ timeout_seconds = {}
             .pfsense_timeout_seconds
             .parse::<u64>()
             .unwrap_or(15)
-            .clamp(5, 120)
+            .clamp(5, 120),
+        settings.pfsense_ca_cert_path
     );
     fs::write(&settings.config_path, config)
         .with_context(|| format!("write {}", settings.config_path))
@@ -1831,15 +1841,33 @@ struct PfsenseClient {
 }
 
 impl PfsenseClient {
-    fn new(base_url: &str, api_key: &str, timeout_seconds: u64) -> Result<Self> {
+    fn new(
+        base_url: &str,
+        api_key: &str,
+        timeout_seconds: u64,
+        ca_cert_path: &str,
+    ) -> Result<Self> {
         let base_url = base_url.trim().trim_end_matches('/').to_owned();
         if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
             bail!("URL pfSense должен начинаться с http:// или https://");
         }
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(timeout_seconds.clamp(5, 120)))
-            .build()
-            .context("создание HTTP-клиента pfSense")?;
+        let mut builder = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(timeout_seconds.clamp(5, 120)));
+        if !ca_cert_path.trim().is_empty() {
+            let certificate_bytes = fs::read(ca_cert_path)
+                .with_context(|| format!("чтение CA-сертификата pfSense: {ca_cert_path}"))?;
+            let certificate = if certificate_bytes
+                .windows(b"-----BEGIN CERTIFICATE-----".len())
+                .any(|window| window == b"-----BEGIN CERTIFICATE-----")
+            {
+                reqwest::Certificate::from_pem(&certificate_bytes)
+            } else {
+                reqwest::Certificate::from_der(&certificate_bytes)
+            }
+            .context("разбор CA-сертификата pfSense")?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        let client = builder.build().context("создание HTTP-клиента pfSense")?;
         Ok(Self {
             client,
             base_url,
@@ -2081,7 +2109,7 @@ mod tests {
 
     #[test]
     fn pfsense_url_must_use_http_scheme() {
-        assert!(PfsenseClient::new("10.35.0.1", "test", 15).is_err());
-        assert!(PfsenseClient::new("https://10.35.0.1", "test", 15).is_ok());
+        assert!(PfsenseClient::new("10.35.0.1", "test", 15, "").is_err());
+        assert!(PfsenseClient::new("https://10.35.0.1", "test", 15, "").is_ok());
     }
 }
