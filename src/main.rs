@@ -2006,7 +2006,9 @@ impl PfsenseClient {
     }
 
     fn get_paginated_array(&self, path: &str) -> Result<Vec<serde_json::Value>> {
-        const PAGE_SIZE: usize = 1;
+        // pfSense отвечает на пагинацию, но слишком маленькая страница
+        // превращает чтение нескольких сотен правил в долгую серию запросов.
+        const PAGE_SIZE: usize = 50;
         const MAX_PAGES: usize = 1000;
         let mut items = Vec::new();
         for page in 0..MAX_PAGES {
