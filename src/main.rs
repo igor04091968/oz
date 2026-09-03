@@ -17,6 +17,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -111,6 +112,25 @@ struct RemoteWorkRequest {
     request_num: String,
     requester: String,
     por_neisp: i32,
+}
+
+const PFSENSE_CACHE_TTL_SECONDS: u64 = 3600;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PfsenseRuleCache {
+    schema_version: u32,
+    created_at: u64,
+    interface: String,
+    rules: Vec<PfsenseRuleGrant>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PfsenseRuleGrant {
+    key: String,
+    description: String,
+    source: String,
+    destination: String,
+    schedule: String,
 }
 
 // Точка входа выбирает GUI, если аргументы не переданы. Это позволяет запускать
@@ -530,8 +550,6 @@ impl GuiApp {
         let rules_interface = self.settings.pfsense_rules_interface.trim().to_owned();
         let ca_cert_path = self.settings.pfsense_ca_cert_path.trim().to_owned();
         let skip_tls_verify = self.settings.pfsense_skip_tls_verify;
-        let sql_settings = self.settings.clone();
-        let mssql_password = self.mssql_password.clone();
         let tx = self.result_tx.clone();
         if !self.settings.pfsense_enabled {
             self.status = "pfSense API: включите интеграцию в настройках.".to_owned();
@@ -545,7 +563,6 @@ impl GuiApp {
         }
         self.status = "Проверка pfSense REST API v2...".to_owned();
         thread::spawn(move || {
-            let sql_requests = fetch_gui_requests(&sql_settings, &mssql_password).ok();
             let message = match PfsenseClient::new(
                 &base_url,
                 &api_key,
@@ -553,8 +570,16 @@ impl GuiApp {
                 &ca_cert_path,
                 skip_tls_verify,
             )
-            .and_then(|client| client.health_check(&rules_interface, sql_requests.as_deref()))
-            {
+            .and_then(|client| {
+                let cache = client.fetch_rule_cache(&rules_interface)?;
+                save_pfsense_rule_cache(&cache)?;
+                Ok(format!(
+                    "кэш разрешений обновлён: {} активных правил, интерфейс {}, TTL {} с",
+                    cache.rules.len(),
+                    cache.interface,
+                    PFSENSE_CACHE_TTL_SECONDS
+                ))
+            }) {
                 Ok(summary) => format!("OZ_FOCUS\npfSense REST API v2 доступен. {summary}"),
                 Err(error) => format!("pfSense REST API v2: проверка не пройдена: {error:#}"),
             };
@@ -655,6 +680,19 @@ fn run_gui_poll(
     } else {
         format!("Ошибка ({}).\n{}{}", output.status, stdout, stderr)
     };
+
+    if settings.pfsense_enabled {
+        match load_valid_pfsense_cache(&settings.pfsense_rules_interface) {
+            Ok(cache) => message.push_str(&format!(
+                "\nПроверка доступа по кэшу pfSense ({}):\n{}",
+                cache.interface,
+                format_access_report(&stdout, &cache)
+            )),
+            Err(error) => message.push_str(&format!(
+                "\nДоступ по pfSense не проверен: кэш недоступен или устарел ({error})"
+            )),
+        }
+    }
 
     // Уведомление отправляется только при изменении набора необработанных заявок.
     // Поэтому один и тот же запрос не создает поток сообщений каждую минуту.
@@ -1209,7 +1247,7 @@ impl eframe::App for GuiApp {
                     if ui
                         .add_enabled(
                             self.settings.pfsense_enabled && !self.pfsense_api_key.is_empty(),
-                            eframe::egui::Button::new("Проверить API v2"),
+                            eframe::egui::Button::new("Обновить кэш разрешений"),
                         )
                         .clicked()
                     {
@@ -1448,6 +1486,52 @@ fn format_quick_report(output: &str) -> Option<String> {
     Some(report)
 }
 
+fn format_access_report(output: &str, cache: &PfsenseRuleCache) -> String {
+    let mut rows = Vec::new();
+    for line in output
+        .lines()
+        .filter(|line| line.starts_with("OZ_ACCESS_REQUEST "))
+    {
+        let Some(fields) = line.strip_prefix("OZ_ACCESS_REQUEST ") else {
+            continue;
+        };
+        let Some((number, rest)) = fields.split_once(" requester=") else {
+            continue;
+        };
+        let Some((requester, status)) = rest.rsplit_once(" status=") else {
+            continue;
+        };
+        let requester = requester.trim();
+        let key = normalized_requester_key(requester);
+        let matching_rule = key.as_deref().and_then(|key| {
+            cache
+                .rules
+                .iter()
+                .find(|rule| rule.key == key || rule.key.starts_with(&format!("{key}_")))
+        });
+        let access = match (status, matching_rule) {
+            ("processed", Some(rule)) => format!(
+                "доступ разрешён; правило {}; расписание {}",
+                rule.description, rule.schedule
+            ),
+            ("processed", None) => "доступ запрещён: разрешающее правило не найдено".to_owned(),
+            ("approved", _) => "заявка согласована, но ещё не обработана".to_owned(),
+            _ => "заявка ожидает обработки".to_owned(),
+        };
+        rows.push(format!(
+            "№ {} — {}: {}",
+            number.trim().trim_start_matches("num="),
+            requester,
+            access
+        ));
+    }
+    if rows.is_empty() {
+        "Заявок в текущем SQL-окне нет.".to_owned()
+    } else {
+        rows.join("\n")
+    }
+}
+
 fn text_field(ui: &mut eframe::egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -1464,6 +1548,40 @@ fn password_field(ui: &mut eframe::egui::Ui, label: &str, value: &mut String) {
 
 fn gui_settings_path() -> PathBuf {
     PathBuf::from("gui-settings.toml")
+}
+
+fn pfsense_cache_path() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("определение директории программы")?;
+    Ok(executable
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("pfsense-rules-cache.json"))
+}
+
+fn save_pfsense_rule_cache(cache: &PfsenseRuleCache) -> Result<()> {
+    let path = pfsense_cache_path()?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(cache)?)
+        .with_context(|| format!("запись временного кэша pfSense {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("атомарная замена кэша pfSense {}", path.display()))
+}
+
+fn load_valid_pfsense_cache(interface: &str) -> Result<PfsenseRuleCache> {
+    let path = pfsense_cache_path()?;
+    let raw = fs::read(&path).with_context(|| format!("чтение кэша pfSense {}", path.display()))?;
+    let cache: PfsenseRuleCache = serde_json::from_slice(&raw).context("разбор кэша pfSense")?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    if cache.schema_version != 1 || cache.interface != interface {
+        bail!("кэш pfSense не соответствует текущему интерфейсу или версии");
+    }
+    if now.saturating_sub(cache.created_at) > PFSENSE_CACHE_TTL_SECONDS {
+        bail!(
+            "кэш pfSense устарел (старше {} секунд)",
+            PFSENSE_CACHE_TTL_SECONDS
+        );
+    }
+    Ok(cache)
 }
 
 fn load_gui_settings() -> Result<GuiSettings> {
@@ -1504,23 +1622,6 @@ fn build_connection_string(settings: &GuiSettings, password: &str) -> String {
         "server=tcp:{},{};database={};{};TrustServerCertificate=true",
         settings.sql_server, settings.sql_port, settings.sql_database, auth
     )
-}
-
-fn fetch_gui_requests(settings: &GuiSettings, password: &str) -> Result<Vec<RemoteWorkRequest>> {
-    let query = fs::read_to_string(&settings.query_file)
-        .with_context(|| format!("read request query file {}", settings.query_file))?;
-    let query = query_for_poll_lookback(
-        &query,
-        settings
-            .poll_lookback_days
-            .parse::<u32>()
-            .unwrap_or(default_poll_lookback_days()),
-    )?;
-    let config = SqlConfig {
-        connection_string_env: "MSSQL_CONNECTION_STRING".to_owned(),
-        default_connection_string: Some(build_connection_string(settings, password)),
-    };
-    tokio::runtime::Runtime::new()?.block_on(fetch_remote_work_requests(&config, &query))
 }
 
 // Генерируем минимальный runtime config для дочернего process-requests.
@@ -1673,6 +1774,20 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     for request in &pending_requests {
         println!(
             "OZ_PENDING_REQUEST num={} requester={}",
+            request.request_num, request.requester
+        );
+    }
+
+    for request in &requests {
+        let status = if audit.is_request_processed(&request.request_num)? {
+            "processed"
+        } else if request.por_neisp != 0 {
+            "waiting"
+        } else {
+            "approved"
+        };
+        println!(
+            "OZ_ACCESS_REQUEST num={} requester={} status={status}",
             request.request_num, request.requester
         );
     }
@@ -1949,6 +2064,72 @@ impl PfsenseClient {
             .context("разбор ответа pfSense API")
     }
 
+    fn fetch_rule_cache(&self, rules_interface: &str) -> Result<PfsenseRuleCache> {
+        let rules_interface = rules_interface.trim();
+        if rules_interface.is_empty()
+            || !rules_interface.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            bail!("интерфейс правил pfSense содержит недопустимые символы");
+        }
+        let rules = self.get_paginated_array("firewall/rules")?;
+        let schedules = self.get_paginated_array("firewall/schedules")?;
+        let active_schedules: std::collections::HashSet<&str> = schedules
+            .iter()
+            .filter(|schedule| {
+                schedule.get("active").and_then(serde_json::Value::as_bool) == Some(true)
+            })
+            .filter_map(|schedule| schedule.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        let grants = rules
+            .iter()
+            .filter(|rule| {
+                rule.get("interface")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|interfaces| {
+                        interfaces
+                            .iter()
+                            .any(|interface| interface.as_str() == Some(rules_interface))
+                    })
+            })
+            .filter(|rule| rule.get("disabled").and_then(serde_json::Value::as_bool) != Some(true))
+            .filter(|rule| rule.get("type").and_then(serde_json::Value::as_str) == Some("pass"))
+            .filter_map(|rule| {
+                let schedule = rule.get("sched").and_then(serde_json::Value::as_str)?;
+                if !active_schedules.contains(schedule) {
+                    return None;
+                }
+                let description = rule
+                    .get("descr")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("без описания");
+                Some(PfsenseRuleGrant {
+                    key: pfsense_rule_key(description),
+                    description: description.to_owned(),
+                    source: rule
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?")
+                        .to_owned(),
+                    destination: rule
+                        .get("destination")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?")
+                        .to_owned(),
+                    schedule: schedule.to_owned(),
+                })
+            })
+            .collect();
+        Ok(PfsenseRuleCache {
+            schema_version: 1,
+            created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            interface: rules_interface.to_owned(),
+            rules: grants,
+        })
+    }
+
+    #[allow(dead_code)]
     fn health_check(
         &self,
         rules_interface: &str,
