@@ -444,20 +444,31 @@ impl GuiApp {
                                         SIP_ANNOUNCEMENT_DELAY_SECONDS,
                                     ));
                                     if let Some(call) = weak_call.upgrade()
-                                        && let Some(writer) = call.paced_pcm_writer()
+                                        && let Some(writer) = call.pcm_writer()
                                     {
-                                        match writer.send((*samples).clone()) {
-                                            Ok(()) => info!(
-                                                file = %file_name,
-                                                delay_seconds = SIP_ANNOUNCEMENT_DELAY_SECONDS,
-                                                "SIP voice message playback started"
-                                            ),
-                                            Err(error) => warn!(
-                                                file = %file_name,
-                                                error = %error,
-                                                "SIP voice message playback failed"
-                                            ),
+                                        const PCMA_FRAME_SAMPLES: usize = 160;
+                                        let mut sent_frames = 0usize;
+                                        for chunk in samples.chunks(PCMA_FRAME_SAMPLES) {
+                                            let mut frame = chunk.to_vec();
+                                            frame.resize(PCMA_FRAME_SAMPLES, 0);
+                                            if let Err(error) = writer.send(frame) {
+                                                warn!(
+                                                    file = %file_name,
+                                                    error = %error,
+                                                    frame = sent_frames,
+                                                    "SIP voice message frame send failed"
+                                                );
+                                                break;
+                                            }
+                                            sent_frames += 1;
+                                            thread::sleep(Duration::from_millis(20));
                                         }
+                                        info!(
+                                            file = %file_name,
+                                            frames = sent_frames,
+                                            delay_seconds = SIP_ANNOUNCEMENT_DELAY_SECONDS,
+                                            "SIP voice message playback started"
+                                        );
                                     } else {
                                         warn!(
                                             file = %file_name,
