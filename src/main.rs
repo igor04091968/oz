@@ -11,6 +11,7 @@
 //! окружения.
 
 use std::fs;
+use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -116,6 +117,13 @@ struct RemoteWorkRequest {
 
 const PFSENSE_CACHE_TTL_SECONDS: u64 = 3600;
 const SIP_ANNOUNCEMENT_DELAY_SECONDS: u64 = 5;
+
+fn write_sip_diagnostic(message: &str) {
+    let path = std::env::temp_dir().join("oz-sip-media.log");
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{message}");
+    }
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct PfsenseRuleCache {
@@ -407,6 +415,7 @@ impl GuiApp {
                 .user_agent("OZ-virtual-phone/0.1")
                 .build();
             let phone = Phone::new(config);
+            let incoming_tx = tx.clone();
             phone.on_incoming(move |call| {
                 // Callback регистрируется до автоответа: xphone вызовет его
                 // после согласования SDP и готовности RTP-медиаканала.
@@ -428,13 +437,24 @@ impl GuiApp {
                     };
                     match audio_result {
                         Ok(samples) => {
+                            let frame_count = samples.len().div_ceil(160);
+                            let prepared = format!(
+                                "SIP_AUDIO_PREPARED samples={} frames={frame_count}",
+                                samples.len()
+                            );
+                            write_sip_diagnostic(&prepared);
+                            let _ = incoming_tx.send(prepared);
                             let weak_call = Arc::downgrade(&call);
                             let file_name = audio_file.clone();
                             let samples = Arc::new(samples);
+                            let media_tx = incoming_tx.clone();
                             call.on_media(move || {
                                 let weak_call = weak_call.clone();
                                 let file_name = file_name.clone();
                                 let samples = Arc::clone(&samples);
+                                let media_tx = media_tx.clone();
+                                write_sip_diagnostic("SIP_MEDIA_CALLBACK_FIRED");
+                                let _ = media_tx.send("SIP_MEDIA_CALLBACK_FIRED".to_owned());
                                 thread::spawn(move || {
                                     // АТС сначала отвечает на виртуальный номер 1000,
                                     // затем дозванивается до целевого абонента и только
@@ -446,6 +466,8 @@ impl GuiApp {
                                     if let Some(call) = weak_call.upgrade()
                                         && let Some(writer) = call.pcm_writer()
                                     {
+                                        write_sip_diagnostic("SIP_PCM_WRITER_ACQUIRED");
+                                        let _ = media_tx.send("SIP_PCM_WRITER_ACQUIRED".to_owned());
                                         const PCMA_FRAME_SAMPLES: usize = 160;
                                         let mut sent_frames = 0usize;
                                         for chunk in samples.chunks(PCMA_FRAME_SAMPLES) {
@@ -469,7 +491,14 @@ impl GuiApp {
                                             delay_seconds = SIP_ANNOUNCEMENT_DELAY_SECONDS,
                                             "SIP voice message playback started"
                                         );
+                                        let sent = format!(
+                                            "SIP_RTP_FRAMES_SENT count={sent_frames}"
+                                        );
+                                        write_sip_diagnostic(&sent);
+                                        let _ = media_tx.send(sent);
                                     } else {
+                                        write_sip_diagnostic("SIP_PCM_WRITER_UNAVAILABLE");
+                                        let _ = media_tx.send("SIP_PCM_WRITER_UNAVAILABLE".to_owned());
                                         warn!(
                                             file = %file_name,
                                             "SIP voice message playback skipped: call media is unavailable"
@@ -479,6 +508,9 @@ impl GuiApp {
                             });
                         }
                         Err(error) => {
+                            let diagnostic = format!("SIP_AUDIO_PREPARE_FAILED error={error:#}");
+                            write_sip_diagnostic(&diagnostic);
+                            let _ = incoming_tx.send(diagnostic);
                             warn!(file = %audio_file, error = %error, "SIP voice message unavailable");
                         }
                     }
