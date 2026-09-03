@@ -181,6 +181,7 @@ struct GuiSettings {
     pfsense_url: String,
     pfsense_timeout_seconds: String,
     pfsense_ca_cert_path: String,
+    pfsense_skip_tls_verify: bool,
 }
 
 impl Default for GuiSettings {
@@ -217,6 +218,7 @@ impl Default for GuiSettings {
             pfsense_url: "https://10.35.0.1".to_owned(),
             pfsense_timeout_seconds: "15".to_owned(),
             pfsense_ca_cert_path: String::new(),
+            pfsense_skip_tls_verify: false,
         }
     }
 }
@@ -524,6 +526,7 @@ impl GuiApp {
             .clamp(5, 120);
         let api_key = self.pfsense_api_key.clone();
         let ca_cert_path = self.settings.pfsense_ca_cert_path.trim().to_owned();
+        let skip_tls_verify = self.settings.pfsense_skip_tls_verify;
         let tx = self.result_tx.clone();
         if !self.settings.pfsense_enabled {
             self.status = "pfSense API: включите интеграцию в настройках.".to_owned();
@@ -537,8 +540,14 @@ impl GuiApp {
         }
         self.status = "Проверка pfSense REST API v2...".to_owned();
         thread::spawn(move || {
-            let message = match PfsenseClient::new(&base_url, &api_key, timeout, &ca_cert_path)
-                .and_then(|client| client.health_check())
+            let message = match PfsenseClient::new(
+                &base_url,
+                &api_key,
+                timeout,
+                &ca_cert_path,
+                skip_tls_verify,
+            )
+            .and_then(|client| client.health_check())
             {
                 Ok(summary) => format!("OZ_FOCUS\npfSense REST API v2 доступен. {summary}"),
                 Err(error) => format!("pfSense REST API v2: проверка не пройдена: {error:#}"),
@@ -1175,6 +1184,16 @@ impl eframe::App for GuiApp {
                         "CA-сертификат pfSense",
                         &mut self.settings.pfsense_ca_cert_path,
                     );
+                    ui.checkbox(
+                        &mut self.settings.pfsense_skip_tls_verify,
+                        "Пропустить проверку TLS-сертификата (только закрытая сеть)",
+                    );
+                    if self.settings.pfsense_skip_tls_verify {
+                        ui.colored_label(
+                            eframe::egui::Color32::RED,
+                            "ВНИМАНИЕ: сертификат pfSense не проверяется.",
+                        );
+                    }
                     password_field(ui, "API-ключ", &mut self.pfsense_api_key);
                     if ui
                         .add_enabled(
@@ -1504,6 +1523,7 @@ base_url = {:?}
 api_key_env = "OZ_PFSENSE_API_KEY"
 timeout_seconds = {}
 ca_cert_path = {:?}
+skip_tls_verify = {}
 "#,
         interval_seconds,
         settings.audit_db_path,
@@ -1523,7 +1543,8 @@ ca_cert_path = {:?}
             .parse::<u64>()
             .unwrap_or(15)
             .clamp(5, 120),
-        settings.pfsense_ca_cert_path
+        settings.pfsense_ca_cert_path,
+        settings.pfsense_skip_tls_verify
     );
     fs::write(&settings.config_path, config)
         .with_context(|| format!("write {}", settings.config_path))
@@ -1846,6 +1867,7 @@ impl PfsenseClient {
         api_key: &str,
         timeout_seconds: u64,
         ca_cert_path: &str,
+        skip_tls_verify: bool,
     ) -> Result<Self> {
         let base_url = base_url.trim().trim_end_matches('/').to_owned();
         if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
@@ -1866,6 +1888,11 @@ impl PfsenseClient {
             }
             .context("разбор CA-сертификата pfSense")?;
             builder = builder.add_root_certificate(certificate);
+        }
+        if skip_tls_verify {
+            builder = builder
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true);
         }
         let client = builder.build().context("создание HTTP-клиента pfSense")?;
         Ok(Self {
@@ -2109,7 +2136,8 @@ mod tests {
 
     #[test]
     fn pfsense_url_must_use_http_scheme() {
-        assert!(PfsenseClient::new("10.35.0.1", "test", 15, "").is_err());
-        assert!(PfsenseClient::new("https://10.35.0.1", "test", 15, "").is_ok());
+        assert!(PfsenseClient::new("10.35.0.1", "test", 15, "", false).is_err());
+        assert!(PfsenseClient::new("https://10.35.0.1", "test", 15, "", false).is_ok());
+        assert!(PfsenseClient::new("https://10.35.0.1", "test", 15, "", true).is_ok());
     }
 }
