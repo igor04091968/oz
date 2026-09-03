@@ -212,6 +212,8 @@ struct GuiSettings {
     pfsense_rules_interface: String,
     pfsense_ca_cert_path: String,
     pfsense_skip_tls_verify: bool,
+    pfsense_auto_refresh: bool,
+    pfsense_refresh_interval_seconds: String,
 }
 
 impl Default for GuiSettings {
@@ -250,6 +252,8 @@ impl Default for GuiSettings {
             pfsense_rules_interface: "openvpn".to_owned(),
             pfsense_ca_cert_path: String::new(),
             pfsense_skip_tls_verify: false,
+            pfsense_auto_refresh: false,
+            pfsense_refresh_interval_seconds: "3600".to_owned(),
         }
     }
 }
@@ -328,6 +332,38 @@ impl GuiApp {
         let stop = Arc::clone(&self.stop);
         self.running = true;
         self.status = "Фоновый опрос запущен.".to_owned();
+        if settings.pfsense_enabled
+            && settings.pfsense_auto_refresh
+            && !self.pfsense_api_key.trim().is_empty()
+        {
+            let pfsense_settings = settings.clone();
+            let pfsense_api_key = self.pfsense_api_key.clone();
+            let pfsense_stop = Arc::clone(&self.stop);
+            let pfsense_tx = self.result_tx.clone();
+            thread::spawn(move || {
+                let interval = pfsense_settings
+                    .pfsense_refresh_interval_seconds
+                    .parse::<u64>()
+                    .unwrap_or(PFSENSE_CACHE_TTL_SECONDS)
+                    .clamp(60, 86_400);
+                while !pfsense_stop.load(Ordering::Relaxed) {
+                    let message = refresh_pfsense_cache(&pfsense_settings, &pfsense_api_key)
+                        .map(|summary| {
+                            format!("pfSense: автоматическое обновление выполнено: {summary}")
+                        })
+                        .unwrap_or_else(|error| {
+                            format!("pfSense: автообновление не выполнено: {error:#}")
+                        });
+                    let _ = pfsense_tx.send(message);
+                    for _ in 0..interval {
+                        if pfsense_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            });
+        }
         // Фоновый поток не блокирует egui. Результаты каждой проверки возвращаются
         // в GUI через канал, а stop-флаг позволяет корректно завершить поток.
         thread::spawn(move || {
@@ -641,23 +677,14 @@ impl GuiApp {
         }
         self.status = "Проверка pfSense REST API v2...".to_owned();
         thread::spawn(move || {
-            let message = match PfsenseClient::new(
+            let message = match refresh_pfsense_cache_with_values(
                 &base_url,
                 &api_key,
                 timeout,
                 &ca_cert_path,
                 skip_tls_verify,
-            )
-            .and_then(|client| {
-                let cache = client.fetch_rule_cache(&rules_interface)?;
-                save_pfsense_rule_cache(&cache)?;
-                Ok(format!(
-                    "кэш разрешений обновлён: {} активных правил, интерфейс {}, TTL {} с",
-                    cache.rules.len(),
-                    cache.interface,
-                    PFSENSE_CACHE_TTL_SECONDS
-                ))
-            }) {
+                &rules_interface,
+            ) {
                 Ok(summary) => format!("OZ_FOCUS\npfSense REST API v2 доступен. {summary}"),
                 Err(error) => format!("pfSense REST API v2: проверка не пройдена: {error:#}"),
             };
@@ -713,6 +740,44 @@ impl GuiApp {
             let _ = tx.send(message);
         });
     }
+}
+
+fn refresh_pfsense_cache(settings: &GuiSettings, api_key: &str) -> Result<String> {
+    let timeout = settings
+        .pfsense_timeout_seconds
+        .parse::<u64>()
+        .unwrap_or(60)
+        .clamp(5, 300);
+    refresh_pfsense_cache_with_values(
+        &settings.pfsense_url,
+        api_key,
+        timeout,
+        &settings.pfsense_ca_cert_path,
+        settings.pfsense_skip_tls_verify,
+        &settings.pfsense_rules_interface,
+    )
+}
+
+fn refresh_pfsense_cache_with_values(
+    base_url: &str,
+    api_key: &str,
+    timeout: u64,
+    ca_cert_path: &str,
+    skip_tls_verify: bool,
+    rules_interface: &str,
+) -> Result<String> {
+    PfsenseClient::new(base_url, api_key, timeout, ca_cert_path, skip_tls_verify).and_then(
+        |client| {
+            let cache = client.fetch_rule_cache(rules_interface)?;
+            save_pfsense_rule_cache(&cache)?;
+            Ok(format!(
+                "кэш разрешений обновлён: {} активных правил, интерфейс {}, TTL {} с",
+                cache.rules.len(),
+                cache.interface,
+                PFSENSE_CACHE_TTL_SECONDS
+            ))
+        },
+    )
 }
 
 impl Drop for GuiApp {
@@ -1295,6 +1360,18 @@ impl eframe::App for GuiApp {
                     ui.set_min_width(440.0);
                     ui.label(eframe::egui::RichText::new("pfSense REST API v2").strong());
                     ui.checkbox(&mut self.settings.pfsense_enabled, "Включить интеграцию");
+                    ui.checkbox(
+                        &mut self.settings.pfsense_auto_refresh,
+                        "Автоматически обновлять кэш",
+                    );
+                    if self.settings.pfsense_auto_refresh {
+                        text_field(
+                            ui,
+                            "Интервал обновления, секунд",
+                            &mut self.settings.pfsense_refresh_interval_seconds,
+                        );
+                        ui.small("Минимум 60 секунд; применяется после перезапуска опроса.");
+                    }
                     text_field(ui, "URL pfSense", &mut self.settings.pfsense_url);
                     text_field(
                         ui,
