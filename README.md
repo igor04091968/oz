@@ -57,7 +57,9 @@ cargo run -- gui
 API-ключ и выполнить проверку. Таймаут запроса настраивается в секундах
 (по умолчанию 60, допустимый диапазон 5–300). Ключ хранится только в Credential Manager и
 передается только заголовком `X-API-Key`. На текущем этапе OZ выполняет два read-only
-запроса: `/api/v2/system/restapi/version` и `/api/v2/firewall/rules?limit=1`; изменение
+запроса: `/api/v2/system/restapi/version` и `/api/v2/firewall/rules?interface=openvpn`;
+для правил используется интерфейс `openvpn`, соответствующий странице
+`firewall_rules.php?if=openvpn`; изменение
 правил, OpenVPN-пользователей и конфигурации pfSense не выполняется.
 
 Если сертификат pfSense подписан внутренним или самоподписанным CA, укажите в

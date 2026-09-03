@@ -180,6 +180,7 @@ struct GuiSettings {
     pfsense_enabled: bool,
     pfsense_url: String,
     pfsense_timeout_seconds: String,
+    pfsense_rules_interface: String,
     pfsense_ca_cert_path: String,
     pfsense_skip_tls_verify: bool,
 }
@@ -217,6 +218,7 @@ impl Default for GuiSettings {
             pfsense_enabled: false,
             pfsense_url: "https://10.35.0.1".to_owned(),
             pfsense_timeout_seconds: "60".to_owned(),
+            pfsense_rules_interface: "openvpn".to_owned(),
             pfsense_ca_cert_path: String::new(),
             pfsense_skip_tls_verify: false,
         }
@@ -522,9 +524,10 @@ impl GuiApp {
             .pfsense_timeout_seconds
             .trim()
             .parse::<u64>()
-            .unwrap_or(15)
-            .clamp(5, 120);
+            .unwrap_or(60)
+            .clamp(5, 300);
         let api_key = self.pfsense_api_key.clone();
+        let rules_interface = self.settings.pfsense_rules_interface.trim().to_owned();
         let ca_cert_path = self.settings.pfsense_ca_cert_path.trim().to_owned();
         let skip_tls_verify = self.settings.pfsense_skip_tls_verify;
         let tx = self.result_tx.clone();
@@ -547,7 +550,7 @@ impl GuiApp {
                 &ca_cert_path,
                 skip_tls_verify,
             )
-            .and_then(|client| client.health_check())
+            .and_then(|client| client.health_check(&rules_interface))
             {
                 Ok(summary) => format!("OZ_FOCUS\npfSense REST API v2 доступен. {summary}"),
                 Err(error) => format!("pfSense REST API v2: проверка не пройдена: {error:#}"),
@@ -1181,6 +1184,11 @@ impl eframe::App for GuiApp {
                     );
                     text_field(
                         ui,
+                        "Интерфейс правил pfSense",
+                        &mut self.settings.pfsense_rules_interface,
+                    );
+                    text_field(
+                        ui,
                         "CA-сертификат pfSense",
                         &mut self.settings.pfsense_ca_cert_path,
                     );
@@ -1522,6 +1530,7 @@ poll_lookback_days = {}
 base_url = {:?}
 api_key_env = "OZ_PFSENSE_API_KEY"
 timeout_seconds = {}
+rules_interface = {:?}
 ca_cert_path = {:?}
 skip_tls_verify = {}
 "#,
@@ -1543,6 +1552,7 @@ skip_tls_verify = {}
             .parse::<u64>()
             .unwrap_or(60)
             .clamp(5, 300),
+        settings.pfsense_rules_interface,
         settings.pfsense_ca_cert_path,
         settings.pfsense_skip_tls_verify
     );
@@ -1919,24 +1929,28 @@ impl PfsenseClient {
             .context("разбор ответа pfSense API")
     }
 
-    fn health_check(&self) -> Result<String> {
+    fn health_check(&self, rules_interface: &str) -> Result<String> {
         let version = self.get_json("system/restapi/version")?;
-        // Полный список правил может быть большим и на pfSense отвечать слишком
-        // долго. Для health-check достаточно проверить endpoint с одной записью.
-        let rules = self.get_json("firewall/rules?limit=1")?;
+        let rules_interface = rules_interface.trim();
+        if rules_interface.is_empty()
+            || !rules_interface.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            bail!("интерфейс правил pfSense содержит недопустимые символы");
+        }
+        let rules = self.get_json(&format!("firewall/rules?interface={rules_interface}"))?;
         let version_text = version
             .pointer("/data/version")
             .or_else(|| version.pointer("/data"))
             .map(|value| value.to_string())
             .unwrap_or_else(|| "версия не указана".to_owned());
-        let rules_endpoint_available = rules.pointer("/data").is_some();
+        let rule_count = rules
+            .pointer("/data")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
         Ok(format!(
-            "версия API: {version_text}; endpoint firewall/rules: {}",
-            if rules_endpoint_available {
-                "доступен"
-            } else {
-                "ответ получен"
-            }
+            "версия API: {version_text}; правил firewall ({rules_interface}): {rule_count}"
         ))
     }
 }
