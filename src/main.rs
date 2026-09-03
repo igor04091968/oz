@@ -115,6 +115,7 @@ struct RemoteWorkRequest {
 }
 
 const PFSENSE_CACHE_TTL_SECONDS: u64 = 3600;
+const SIP_ANNOUNCEMENT_DELAY_SECONDS: u64 = 5;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct PfsenseRuleCache {
@@ -258,7 +259,6 @@ struct GuiApp {
     sip_stop: Arc<AtomicBool>,
     sip_running: bool,
     sip_ready: bool,
-    bridge_ready: Arc<AtomicBool>,
     announcement_text: Arc<Mutex<String>>,
     result_rx: Receiver<String>,
     result_tx: Sender<String>,
@@ -290,7 +290,6 @@ impl GuiApp {
             sip_stop: Arc::new(AtomicBool::new(false)),
             sip_running: false,
             sip_ready: false,
-            bridge_ready: Arc::new(AtomicBool::new(false)),
             announcement_text: Arc::new(Mutex::new(
                 "Количество заявок на удаленное подключение: 0.".to_owned(),
             )),
@@ -387,11 +386,6 @@ impl GuiApp {
         let password = self.sip_password.clone();
         let audio_enabled = self.settings.sip_audio_enabled;
         let audio_file = self.settings.sip_audio_file.trim().to_owned();
-        let xmpp_server = self.settings.xmpp_server.clone();
-        let xmpp_port = self.settings.xmpp_port.clone();
-        let xmpp_account = self.settings.xmpp_account.clone();
-        let xmpp_password = self.xmpp_password.clone();
-        let bridge_ready = Arc::clone(&self.bridge_ready);
         let announcement_text = Arc::clone(&self.announcement_text);
         if server.is_empty() || username.is_empty() || password.is_empty() {
             self.status = "SIP не запущен: заполните сервер, номер и Secret".to_owned();
@@ -401,17 +395,7 @@ impl GuiApp {
         self.sip_stop = Arc::clone(&stop);
         self.sip_running = true;
         self.sip_ready = false;
-        bridge_ready.store(false, Ordering::Relaxed);
         let tx = self.result_tx.clone();
-        start_xmpp_bridge_listener(
-            &xmpp_server,
-            &xmpp_port,
-            &xmpp_account,
-            &xmpp_password,
-            Arc::clone(&stop),
-            Arc::clone(&bridge_ready),
-            tx.clone(),
-        );
         thread::spawn(move || {
             let config = PhoneBuilder::new()
                 .credentials(&username, &password, &server)
@@ -424,8 +408,6 @@ impl GuiApp {
                 .build();
             let phone = Phone::new(config);
             phone.on_incoming(move |call| {
-                let bridge_ready = Arc::clone(&bridge_ready);
-                bridge_ready.store(false, Ordering::Relaxed);
                 // Callback регистрируется до автоответа: xphone вызовет его
                 // после согласования SDP и готовности RTP-медиаканала.
                 if audio_enabled {
@@ -453,20 +435,21 @@ impl GuiApp {
                                 let weak_call = weak_call.clone();
                                 let file_name = file_name.clone();
                                 let samples = Arc::clone(&samples);
-                                let bridge_ready = Arc::clone(&bridge_ready);
                                 thread::spawn(move || {
-                                    // Ждем фактическое событие от АТС о подключении
-                                    // целевого абонента к bridge. Временной эвристики
-                                    // здесь нет: без подтверждения аудио не отправляем.
-                                    while !bridge_ready.load(Ordering::Relaxed) {
-                                        thread::sleep(Duration::from_millis(100));
-                                    }
+                                    // АТС сначала отвечает на виртуальный номер 1000,
+                                    // затем дозванивается до целевого абонента и только
+                                    // после этого создает bridge. Немедленная передача
+                                    // RTP попадает в первый leg и до абонента не доходит.
+                                    thread::sleep(Duration::from_secs(
+                                        SIP_ANNOUNCEMENT_DELAY_SECONDS,
+                                    ));
                                     if let Some(call) = weak_call.upgrade()
                                         && let Some(writer) = call.paced_pcm_writer()
                                     {
                                         match writer.send((*samples).clone()) {
                                             Ok(()) => info!(
                                                 file = %file_name,
+                                                delay_seconds = SIP_ANNOUNCEMENT_DELAY_SECONDS,
                                                 "SIP voice message playback started"
                                             ),
                                             Err(error) => warn!(
@@ -1007,115 +990,6 @@ async fn send_xmpp_message(
         )
         .await?;
     stream.write_all(b"</stream:stream>").await?;
-    Ok(())
-}
-
-fn start_xmpp_bridge_listener(
-    server: &str,
-    port: &str,
-    account: &str,
-    password: &str,
-    stop: Arc<AtomicBool>,
-    bridge_ready: Arc<AtomicBool>,
-    tx: Sender<String>,
-) {
-    let server = server.to_owned();
-    let port = port.to_owned();
-    let account = account.to_owned();
-    let password = password.to_owned();
-    thread::spawn(move || {
-        while !stop.load(Ordering::Relaxed) {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .enable_time()
-                .build()
-                .map_err(anyhow::Error::from)
-                .and_then(|runtime| {
-                    runtime.block_on(wait_for_xmpp_bridge(
-                        &server,
-                        &port,
-                        &account,
-                        &password,
-                        &stop,
-                        &bridge_ready,
-                        &tx,
-                    ))
-                });
-            if let Err(error) = result
-                && !stop.load(Ordering::Relaxed)
-            {
-                let _ = tx.send(format!("XMPP listener: {error:#}"));
-                thread::sleep(Duration::from_secs(3));
-            }
-        }
-    });
-}
-
-async fn wait_for_xmpp_bridge(
-    server: &str,
-    port: &str,
-    account: &str,
-    password: &str,
-    stop: &AtomicBool,
-    bridge_ready: &AtomicBool,
-    tx: &Sender<String>,
-) -> Result<()> {
-    let (localpart, domain) = account
-        .split_once('@')
-        .context("XMPP account must be a full JID")?;
-    let port: u16 = port.parse().context("invalid XMPP port")?;
-    let mut stream =
-        tokio::time::timeout(Duration::from_secs(15), TcpStream::connect((server, port)))
-            .await
-            .context("XMPP listener connect timeout")??;
-    let stream_open = format!(
-        "<stream:stream to='{domain}' xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' version='1.0'>"
-    );
-    stream.write_all(stream_open.as_bytes()).await?;
-    read_xmpp_until(&mut stream, "<stream:features", "XMPP listener features").await?;
-    let auth =
-        base64::engine::general_purpose::STANDARD.encode(format!("\0{localpart}\0{password}"));
-    stream
-        .write_all(
-            format!(
-                "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>{auth}</auth>"
-            )
-            .as_bytes(),
-        )
-        .await?;
-    read_xmpp_until(&mut stream, "<success", "XMPP listener authentication").await?;
-    stream.write_all(stream_open.as_bytes()).await?;
-    read_xmpp_until(
-        &mut stream,
-        "<stream:features",
-        "XMPP listener bind features",
-    )
-    .await?;
-    stream
-        .write_all(
-            b"<iq id='oz-events-bind-1' type='set'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>oz-events</resource></bind></iq>",
-        )
-        .await?;
-    read_xmpp_until(&mut stream, "oz-events-bind-1", "XMPP listener bind").await?;
-    stream.write_all(b"<presence/>").await?;
-    let mut buffer = [0_u8; 4096];
-    let mut stanza_buffer = String::new();
-    while !stop.load(Ordering::Relaxed) {
-        let read =
-            match tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buffer)).await {
-                Ok(result) => result?,
-                Err(_) => return Ok(()),
-            };
-        if read == 0 {
-            bail!("XMPP listener connection closed");
-        }
-        stanza_buffer.push_str(&String::from_utf8_lossy(&buffer[..read]));
-        if stanza_buffer.contains("OZ_CALL_BRIDGED") {
-            bridge_ready.store(true, Ordering::Release);
-            let _ = tx.send("OZ_FOCUS\nАТС подтвердила подключение абонента к bridge.".to_owned());
-            stanza_buffer.clear();
-        }
-    }
     Ok(())
 }
 
