@@ -1728,9 +1728,9 @@ fn load_config(path: &str) -> Result<AppConfig> {
     toml::from_str(&raw).with_context(|| format!("parse config {path}"))
 }
 
-// Обработка заявок получает свежие данные, исключает уже просмотренные записи
-// и сообщает о состоянии согласования. Изменение внешних систем временно не
-// выполняется: этот режим оставляет заявки доступными для дальнейшей обработки.
+// Обработка заявок получает свежие данные, исключает уже обработанные записи
+// и фиксирует согласованные заявки в локальном аудите. pfSense при этом не
+// изменяется: доступ проверяется GUI по ранее сохраненному кэшу правил.
 async fn process_requests(config: &AppConfig) -> Result<()> {
     let requests_config = config
         .requests
@@ -1784,7 +1784,8 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
         } else if request.por_neisp != 0 {
             "waiting"
         } else {
-            "approved"
+            audit.record_request_processed(request)?;
+            "processed"
         };
         println!(
             "OZ_ACCESS_REQUEST num={} requester={} status={status}",
@@ -1816,10 +1817,11 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
             continue;
         }
 
+        audit.record_request_processed(&request)?;
         info!(
             request_num = request.request_num,
             requester = request.requester,
-            "approved request is ready for operator processing"
+            "approved request processed by OZ"
         );
     }
 
@@ -2370,11 +2372,19 @@ impl Audit {
 
     fn is_request_processed(&self, request_num: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
-            "select count(*) from processed_requests where request_num = ?1",
+            "select count(*) from processed_requests where request_num = ?1 and status = 'processed'",
             params![request_num],
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    fn record_request_processed(&self, request: &RemoteWorkRequest) -> Result<()> {
+        self.conn.execute(
+            "insert or replace into processed_requests (request_num, requester, rule_key, status) values (?1, ?2, null, 'processed')",
+            params![request.request_num, request.requester],
+        )?;
+        Ok(())
     }
 
     fn record_request_skipped(&self, request: &RemoteWorkRequest, status: &str) -> Result<()> {
