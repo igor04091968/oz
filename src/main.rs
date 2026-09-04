@@ -332,6 +332,7 @@ impl GuiApp {
         let stop = Arc::clone(&self.stop);
         self.running = true;
         self.status = "Фоновый опрос запущен.".to_owned();
+        let mut initial_pfsense_refresh = None;
         if settings.pfsense_enabled
             && settings.pfsense_auto_refresh
             && !self.pfsense_api_key.trim().is_empty()
@@ -340,12 +341,15 @@ impl GuiApp {
             let pfsense_api_key = self.pfsense_api_key.clone();
             let pfsense_stop = Arc::clone(&self.stop);
             let pfsense_tx = self.result_tx.clone();
+            let (initial_refresh_tx, initial_refresh_rx) = mpsc::sync_channel(1);
+            initial_pfsense_refresh = Some(initial_refresh_rx);
             thread::spawn(move || {
                 let interval = pfsense_settings
                     .pfsense_refresh_interval_seconds
                     .parse::<u64>()
                     .unwrap_or(PFSENSE_CACHE_TTL_SECONDS)
                     .clamp(60, 86_400);
+                let mut first_attempt = true;
                 while !pfsense_stop.load(Ordering::Relaxed) {
                     let message = refresh_pfsense_cache(&pfsense_settings, &pfsense_api_key)
                         .map(|summary| {
@@ -355,6 +359,12 @@ impl GuiApp {
                             format!("pfSense: автообновление не выполнено: {error:#}")
                         });
                     let _ = pfsense_tx.send(message);
+                    if first_attempt {
+                        // SQL-проверка не должна обгонять первое обновление
+                        // pfSense и читать старый кэш сразу после запуска OZ.
+                        let _ = initial_refresh_tx.send(());
+                        first_attempt = false;
+                    }
                     for _ in 0..interval {
                         if pfsense_stop.load(Ordering::Relaxed) {
                             break;
@@ -368,6 +378,15 @@ impl GuiApp {
         // в GUI через канал, а stop-флаг позволяет корректно завершить поток.
         thread::spawn(move || {
             let mut notified_fingerprint = String::new();
+            if let Some(initial_refresh_rx) = initial_pfsense_refresh {
+                let wait_seconds = settings
+                    .pfsense_timeout_seconds
+                    .parse::<u64>()
+                    .unwrap_or(60)
+                    .clamp(5, 300)
+                    .saturating_add(30);
+                let _ = initial_refresh_rx.recv_timeout(Duration::from_secs(wait_seconds));
+            }
             loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -825,7 +844,10 @@ fn run_gui_poll(
     };
 
     if settings.pfsense_enabled {
-        match load_valid_pfsense_cache(&settings.pfsense_rules_interface) {
+        match load_valid_pfsense_cache(
+            &settings.pfsense_rules_interface,
+            pfsense_cache_max_age_seconds(settings),
+        ) {
             Ok(cache) => message.push_str(&format!(
                 "\nПроверка доступа по кэшу pfSense ({}):\n{}",
                 cache.interface,
@@ -1370,7 +1392,9 @@ impl eframe::App for GuiApp {
                             "Интервал обновления, секунд",
                             &mut self.settings.pfsense_refresh_interval_seconds,
                         );
-                        ui.small("Минимум 60 секунд; применяется после перезапуска опроса.");
+                        ui.small(
+                            "Минимум 60 секунд; применяется после перезапуска опроса. Допустимый возраст кэша учитывает этот интервал и таймаут pfSense.",
+                        );
                     }
                     text_field(ui, "URL pfSense", &mut self.settings.pfsense_url);
                     text_field(
@@ -1722,7 +1746,24 @@ fn save_pfsense_rule_cache(cache: &PfsenseRuleCache) -> Result<()> {
         .with_context(|| format!("атомарная замена кэша pfSense {}", path.display()))
 }
 
-fn load_valid_pfsense_cache(interface: &str) -> Result<PfsenseRuleCache> {
+fn pfsense_cache_max_age_seconds(settings: &GuiSettings) -> u64 {
+    if !settings.pfsense_auto_refresh {
+        return PFSENSE_CACHE_TTL_SECONDS;
+    }
+    let interval = settings
+        .pfsense_refresh_interval_seconds
+        .parse::<u64>()
+        .unwrap_or(PFSENSE_CACHE_TTL_SECONDS)
+        .clamp(60, 86_400);
+    let timeout = settings
+        .pfsense_timeout_seconds
+        .parse::<u64>()
+        .unwrap_or(60)
+        .clamp(5, 300);
+    PFSENSE_CACHE_TTL_SECONDS.max(interval.saturating_add(timeout).saturating_add(60))
+}
+
+fn load_valid_pfsense_cache(interface: &str, max_age_seconds: u64) -> Result<PfsenseRuleCache> {
     let path = pfsense_cache_path()?;
     let raw = fs::read(&path).with_context(|| format!("чтение кэша pfSense {}", path.display()))?;
     let cache: PfsenseRuleCache = serde_json::from_slice(&raw).context("разбор кэша pfSense")?;
@@ -1730,11 +1771,9 @@ fn load_valid_pfsense_cache(interface: &str) -> Result<PfsenseRuleCache> {
     if cache.schema_version != 1 || cache.interface != interface {
         bail!("кэш pfSense не соответствует текущему интерфейсу или версии");
     }
-    if now.saturating_sub(cache.created_at) > PFSENSE_CACHE_TTL_SECONDS {
-        bail!(
-            "кэш pfSense устарел (старше {} секунд)",
-            PFSENSE_CACHE_TTL_SECONDS
-        );
+    let age_seconds = now.saturating_sub(cache.created_at);
+    if age_seconds > max_age_seconds {
+        bail!("кэш pfSense устарел: возраст {age_seconds} с, допустимо {max_age_seconds} с");
     }
     Ok(cache)
 }
@@ -2697,5 +2736,19 @@ mod tests {
         let rule_key = pfsense_rule_key("rachkov_ii_syk83, Приказ №25-132");
         assert_eq!(requester, "rachkov_ii");
         assert!(rule_key == requester || rule_key.starts_with(&format!("{requester}_")));
+    }
+
+    #[test]
+    fn pfsense_cache_age_covers_configured_refresh_interval() {
+        let mut settings = GuiSettings::default();
+        assert_eq!(
+            pfsense_cache_max_age_seconds(&settings),
+            PFSENSE_CACHE_TTL_SECONDS
+        );
+
+        settings.pfsense_auto_refresh = true;
+        settings.pfsense_refresh_interval_seconds = "7200".to_owned();
+        settings.pfsense_timeout_seconds = "120".to_owned();
+        assert_eq!(pfsense_cache_max_age_seconds(&settings), 7380);
     }
 }
