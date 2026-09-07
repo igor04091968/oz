@@ -1,6 +1,6 @@
 [package]
 name = "oz"
-version = "0.1.36"
+version = "0.1.37"
 edition = "2024"
 
 [dependencies]
@@ -21,3 +21,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 xphone = { version = "0.6.0", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.24", default-features = false }
+winreg = "0.55"

@@ -33,6 +33,8 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing::{info, warn};
 use xphone::{Codec as SipCodec, Phone, PhoneBuilder};
 
+mod desktop;
+
 #[derive(Parser)]
 #[command(version, about = "Отслеживание заявок и XMPP/Miranda-интеграция")]
 struct Cli {
@@ -46,7 +48,17 @@ struct Cli {
 enum Command {
     ProcessRequests(CommonArgs),
     Report(ReportArgs),
-    Gui,
+    Gui(GuiArgs),
+}
+
+#[derive(Args, Default)]
+struct GuiArgs {
+    /// Запустить в трее (окно останется доступным при ошибке создания трея).
+    #[arg(long)]
+    start_in_tray: bool,
+    /// Папка настроек и относительных путей; используется при автозапуске.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 }
 
 // Общий аргумент конфигурации. Переменная окружения удобна для запуска из
@@ -154,7 +166,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => run_gui(),
+        None => run_gui(GuiArgs::default()),
         Some(Command::ProcessRequests(args)) => {
             let config = load_config(&args.config)?;
             process_requests(&config).await
@@ -163,7 +175,7 @@ async fn main() -> Result<()> {
             let config = load_config(&args.config)?;
             report_requests(&config, args.period, &args.date).await
         }
-        Some(Command::Gui) => run_gui(),
+        Some(Command::Gui(args)) => run_gui(args),
     }
 }
 
@@ -179,6 +191,7 @@ const PFSENSE_API_KEY: &str = "pfsense-api-key";
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct GuiSettings {
+    close_to_tray: bool,
     config_path: String,
     poll_interval_seconds: String,
     poll_lookback_days: String,
@@ -219,6 +232,7 @@ struct GuiSettings {
 impl Default for GuiSettings {
     fn default() -> Self {
         Self {
+            close_to_tray: true,
             config_path: "config.toml".to_owned(),
             poll_interval_seconds: "60".to_owned(),
             poll_lookback_days: "30".to_owned(),
@@ -259,6 +273,10 @@ impl Default for GuiSettings {
 }
 
 struct GuiApp {
+    desktop: Option<desktop::Desktop>,
+    exit_requested: bool,
+    initial_hide: bool,
+    autostart_enabled: bool,
     settings: GuiSettings,
     mssql_password: String,
     xmpp_password: String,
@@ -290,6 +308,10 @@ impl GuiApp {
         let pfsense_api_key = read_secret(PFSENSE_API_KEY).unwrap_or_default();
         let (result_tx, result_rx) = mpsc::channel();
         Self {
+            desktop: None,
+            exit_requested: false,
+            initial_hide: false,
+            autostart_enabled: false,
             settings,
             mssql_password,
             xmpp_password,
@@ -307,6 +329,23 @@ impl GuiApp {
             )),
             result_rx,
             result_tx,
+        }
+    }
+
+    fn desktop_action(&mut self, action: desktop::Action, ctx: &eframe::egui::Context) {
+        use eframe::egui::ViewportCommand;
+        match action {
+            desktop::Action::Show => desktop::show_window(ctx),
+            desktop::Action::Hide if self.desktop.is_some() => {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            }
+            desktop::Action::Hide => {}
+            desktop::Action::Exit => {
+                self.exit_requested = true;
+                self.stop.store(true, Ordering::Relaxed);
+                self.sip_stop.store(true, Ordering::Relaxed);
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
         }
     }
 
@@ -802,6 +841,7 @@ fn refresh_pfsense_cache_with_values(
 impl Drop for GuiApp {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.sip_stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1291,6 +1331,21 @@ impl eframe::App for GuiApp {
     // egui вызывает update часто. Здесь только читаем сообщения из канала,
     // обновляем статус и рисуем форму; тяжелые операции выполняются в потоках.
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
+        while let Some(action) = self.desktop.as_ref().and_then(|tray| tray.next_action()) {
+            self.desktop_action(action, ctx);
+        }
+        if self.initial_hide {
+            self.initial_hide = false;
+            self.desktop_action(desktop::Action::Hide, ctx);
+        }
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.exit_requested
+            && self.settings.close_to_tray
+            && self.desktop.is_some()
+        {
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
+            self.desktop_action(desktop::Action::Hide, ctx);
+        }
         if let Ok(message) = self.result_rx.try_recv() {
             if message.starts_with("OZ_FOCUS\nВиртуальный SIP-телефон") {
                 self.sip_ready = true;
@@ -1302,8 +1357,7 @@ impl eframe::App for GuiApp {
                 self.running = false;
             }
             if let Some(message) = message.strip_prefix("OZ_FOCUS\n") {
-                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+                self.desktop_action(desktop::Action::Show, ctx);
                 self.status = message.to_owned();
             } else {
                 self.status = message;
@@ -1337,8 +1391,57 @@ impl eframe::App for GuiApp {
                         }
                         ui.close_menu();
                     }
-                    if ui.button("Закрыть").clicked() {
-                        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+                    if ui
+                        .add_enabled(
+                            self.desktop.is_some(),
+                            eframe::egui::Button::new("Скрыть в трей"),
+                        )
+                        .clicked()
+                    {
+                        self.desktop_action(desktop::Action::Hide, ctx);
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.desktop.is_some(),
+                            eframe::egui::Checkbox::new(
+                                &mut self.settings.close_to_tray,
+                                "Крестик скрывает в трей",
+                            ),
+                        )
+                        .changed()
+                        && let Err(error) = save_gui_settings(&self.settings)
+                    {
+                        self.settings.close_to_tray = !self.settings.close_to_tray;
+                        self.status = format!("Ошибка сохранения: {error:#}");
+                    }
+                    let mut autostart = self.autostart_enabled;
+                    if ui
+                        .add_enabled(
+                            cfg!(windows),
+                            eframe::egui::Checkbox::new(
+                                &mut autostart,
+                                "Запускать при входе в Windows (в трее)",
+                            ),
+                        )
+                        .changed()
+                    {
+                        match desktop::set_autostart(autostart) {
+                            Ok(()) => {
+                                self.autostart_enabled = autostart;
+                                self.status = if autostart {
+                                    "Автозапуск включён для текущего пользователя."
+                                } else {
+                                    "Автозапуск отключён."
+                                }
+                                .to_owned();
+                            }
+                            Err(error) => self.status = format!("Ошибка автозапуска: {error:#}"),
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Выход").clicked() {
+                        self.desktop_action(desktop::Action::Exit, ctx);
                     }
                 });
                 ui.menu_button("Подключения", |ui| {
@@ -1875,18 +1978,39 @@ skip_tls_verify = {}
         .with_context(|| format!("write {}", settings.config_path))
 }
 
-fn run_gui() -> Result<()> {
+fn run_gui(args: GuiArgs) -> Result<()> {
+    if let Some(dir) = &args.data_dir {
+        std::env::set_current_dir(dir)
+            .with_context(|| format!("открытие папки настроек {}", dir.display()))?;
+    }
     // У Windows включен windows_subsystem = "windows", поэтому запуск GUI не
     // открывает дополнительное консольное окно.
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "ОЗ — отслеживание заявок",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             apply_microsoft_style(&cc.egui_ctx);
             let mut app = GuiApp::new();
             if app.settings.poll_enabled {
                 app.start();
+            }
+            if cfg!(windows) {
+                match desktop::Desktop::new(&cc.egui_ctx) {
+                    Ok(tray) => {
+                        app.desktop = Some(tray);
+                        app.initial_hide = args.start_in_tray;
+                    }
+                    Err(error) => {
+                        app.status = format!("Трей недоступен, окно остаётся открытым: {error:#}")
+                    }
+                }
+                match desktop::autostart_enabled() {
+                    Ok(enabled) => app.autostart_enabled = enabled,
+                    Err(error) => {
+                        app.status = format!("Не удалось проверить автозапуск: {error:#}")
+                    }
+                }
             }
             Ok(Box::new(app))
         }),
@@ -2593,6 +2717,32 @@ impl Audit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_startup_arguments_preserve_data_directory() {
+        let cli = Cli::try_parse_from([
+            "oz",
+            "gui",
+            "--start-in-tray",
+            "--data-dir",
+            "C:\\Данные ОЗ",
+        ])
+        .unwrap();
+        let Some(Command::Gui(args)) = cli.command else {
+            panic!("expected GUI")
+        };
+        assert!(args.start_in_tray);
+        assert_eq!(args.data_dir, Some(PathBuf::from("C:\\Данные ОЗ")));
+    }
+
+    #[test]
+    fn existing_gui_settings_enable_close_to_tray_without_migration() {
+        let settings: GuiSettings = toml::from_str("poll_enabled = false").unwrap();
+        assert!(settings.close_to_tray);
+        assert!(!settings.poll_enabled);
+        let saved = toml::to_string(&settings).unwrap();
+        assert!(toml::from_str::<GuiSettings>(&saved).unwrap().close_to_tray);
+    }
 
     #[test]
     fn pending_hash_is_stable() {

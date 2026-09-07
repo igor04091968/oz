@@ -1,4 +1,5 @@
 config_path = "config.toml"
+close_to_tray = true
 poll_interval_seconds = "60"
 poll_lookback_days = "30"
 poll_enabled = true
