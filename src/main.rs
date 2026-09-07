@@ -1330,7 +1330,11 @@ fn resample_pcm(samples: &[i16], input_rate: u32) -> Result<Vec<i16>> {
 impl eframe::App for GuiApp {
     // egui вызывает update часто. Здесь только читаем сообщения из канала,
     // обновляем статус и рисуем форму; тяжелые операции выполняются в потоках.
-    fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
+        desktop::remember_window(frame);
+        if desktop::force_exit_requested() {
+            self.exit_requested = true;
+        }
         while let Some(action) = self.desktop.as_ref().and_then(|tray| tray.next_action()) {
             self.desktop_action(action, ctx);
         }

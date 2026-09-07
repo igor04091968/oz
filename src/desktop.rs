@@ -2,6 +2,13 @@
 
 use anyhow::Result;
 use eframe::egui::{Context, ViewportCommand};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+
+#[cfg(windows)]
+static WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
+#[cfg(windows)]
+static FORCE_EXIT: AtomicBool = AtomicBool::new(false);
 
 pub fn show_window(ctx: &Context) {
     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
@@ -15,6 +22,30 @@ pub enum Action {
     Show,
     Hide,
     Exit,
+}
+
+#[cfg(windows)]
+pub fn remember_window(frame: &eframe::Frame) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+
+    if let Ok(handle) = frame.window_handle()
+        && let RawWindowHandle::Win32(handle) = handle.as_raw()
+    {
+        WINDOW_HWND.store(handle.hwnd.get(), Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn remember_window(_frame: &eframe::Frame) {}
+
+#[cfg(windows)]
+pub fn force_exit_requested() -> bool {
+    FORCE_EXIT.load(Ordering::Relaxed)
+}
+
+#[cfg(not(windows))]
+pub fn force_exit_requested() -> bool {
+    false
 }
 
 // Windows command-line quoting, including paths ending with a backslash.
@@ -61,6 +92,9 @@ mod platform {
     use tray_icon::{
         Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, SW_RESTORE, SetForegroundWindow, ShowWindow, WM_CLOSE,
+    };
     use winreg::{RegKey, enums::*};
 
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -69,6 +103,27 @@ mod platform {
     pub struct Desktop {
         _tray: TrayIcon,
         events: Receiver<Action>,
+    }
+
+    fn native_show_window() {
+        let hwnd = WINDOW_HWND.load(Ordering::Relaxed);
+        if hwnd != 0 {
+            // The tray callback can run while egui is not repainting a hidden viewport.
+            unsafe {
+                ShowWindow(hwnd as _, SW_RESTORE);
+                SetForegroundWindow(hwnd as _);
+            }
+        }
+    }
+
+    fn native_request_exit() {
+        FORCE_EXIT.store(true, Ordering::Relaxed);
+        let hwnd = WINDOW_HWND.load(Ordering::Relaxed);
+        if hwnd != 0 {
+            unsafe {
+                PostMessageW(hwnd as _, WM_CLOSE, 0, 0);
+            }
+        }
     }
 
     impl Desktop {
@@ -118,6 +173,11 @@ mod platform {
                 } else {
                     return;
                 };
+                match action {
+                    Action::Show => native_show_window(),
+                    Action::Exit => native_request_exit(),
+                    Action::Hide => {}
+                }
                 let _ = menu_tx.send(action);
                 // Wake the GUI even when its native window is hidden/minimized.
                 if matches!(action, Action::Show | Action::Exit) {
@@ -135,6 +195,7 @@ mod platform {
                         ..
                     }
                 ) {
+                    native_show_window();
                     let _ = tx.send(Action::Show);
                     show_window(&tray_ctx);
                 }

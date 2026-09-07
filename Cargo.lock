@@ -2862,13 +2862,14 @@ dependencies = [
 
 [[package]]
 name = "oz"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "anyhow",
  "base64",
  "clap",
  "eframe",
  "keyring",
+ "raw-window-handle",
  "reqwest",
  "rusqlite",
  "serde",
@@ -2881,6 +2882,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "windows-sys 0.61.2",
  "winreg",
  "xphone",
 ]
