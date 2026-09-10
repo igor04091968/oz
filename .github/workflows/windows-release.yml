@@ -14,6 +14,9 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      # Do not require a separately installed VC++ Redistributable on Windows 10.
+      RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v4
         with:
