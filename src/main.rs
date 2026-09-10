@@ -157,15 +157,7 @@ struct PfsenseRuleGrant {
 // Точка входа выбирает GUI, если аргументы не переданы. Это позволяет запускать
 // собранный oz.exe двойным щелчком с рабочего стола.
 #[tokio::main]
-async fn main() {
-    install_diagnostics();
-    if let Err(error) = run_main().await {
-        record_diagnostic(&format!("fatal error: {error:#}"));
-        eprintln!("OZ fatal error: {error:#}");
-    }
-}
-
-async fn run_main() -> Result<()> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .json()
@@ -185,47 +177,6 @@ async fn run_main() -> Result<()> {
         }
         Some(Command::Gui(args)) => run_gui(args),
     }
-}
-
-fn diagnostics_log_path() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_STATE_HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("OZ").join("logs");
-    let _ = fs::create_dir_all(&dir);
-    dir.join("oz.log")
-}
-
-fn record_diagnostic(message: &str) {
-    let path = diagnostics_log_path();
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|value| value.as_secs())
-            .unwrap_or_default();
-        let _ = writeln!(file, "[{stamp}] {message}");
-    }
-}
-
-fn install_diagnostics() {
-    std::panic::set_hook(Box::new(|info| {
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("non-string panic payload");
-        let location = info
-            .location()
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown location".to_owned());
-        record_diagnostic(&format!(
-            "panic thread={:?} location={location}: {payload}",
-            std::thread::current().name()
-        ));
-    }));
-    record_diagnostic("process started");
 }
 
 const GUI_SERVICE: &str = "oz";
@@ -1367,9 +1318,6 @@ fn resample_pcm(samples: &[i16], input_rate: u32) -> Result<Vec<i16>> {
     if input_rate == 0 {
         bail!("некорректная частота дискретизации");
     }
-    if samples.is_empty() {
-        bail!("PCM-данные отсутствуют");
-    }
     let output_len = ((samples.len() as u64 * 8000) / input_rate as u64) as usize;
     let mut output = Vec::with_capacity(output_len.max(1));
     for index in 0..output_len {
@@ -2041,17 +1989,8 @@ fn run_gui(args: GuiArgs) -> Result<()> {
     }
     // У Windows включен windows_subsystem = "windows", поэтому запуск GUI не
     // открывает дополнительное консольное окно.
-    #[cfg(windows)]
-    let options = eframe::NativeOptions {
-        // WARP/software rendering is slower but avoids frequent OpenGL driver
-        // resets on older Windows 10 adapters and RDP sessions.
-        hardware_acceleration: eframe::HardwareAcceleration::Off,
-        vsync: false,
-        ..eframe::NativeOptions::default()
-    };
-    #[cfg(not(windows))]
     let options = eframe::NativeOptions::default();
-    let result = eframe::run_native(
+    eframe::run_native(
         "ОЗ — отслеживание заявок",
         options,
         Box::new(move |cc| {
@@ -2079,11 +2018,8 @@ fn run_gui(args: GuiArgs) -> Result<()> {
             }
             Ok(Box::new(app))
         }),
-    );
-    if let Err(error) = &result {
-        record_diagnostic(&format!("GUI failed: {error}"));
-    }
-    result.map_err(|error| anyhow::anyhow!("GUI failed: {error}"))
+    )
+    .map_err(|error| anyhow::anyhow!("GUI failed: {error}"))
 }
 
 // Сдержанная светлая тема в духе стандартных приложений Windows: белая рабочая
@@ -2865,11 +2801,6 @@ mod tests {
         let actual = query_for_poll_lookback(query, 30).unwrap();
         assert!(actual.contains("set @d1 = dateadd(day, -29, cast(getdate() as date));"));
         assert!(actual.contains("set @d2 = cast(getdate() as date);"));
-    }
-
-    #[test]
-    fn resample_rejects_empty_pcm_instead_of_panicking() {
-        assert!(resample_pcm(&[], 16_000).is_err());
     }
 
     #[test]
