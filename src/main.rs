@@ -932,14 +932,14 @@ fn run_gui_poll(
         format!("Ошибка ({}).\n{}{}", output.status, stdout, stderr)
     };
 
-    let mut permanent_access_notice = None;
+    let mut permanent_access_message = None;
     if settings.pfsense_enabled {
         match load_valid_pfsense_cache(
             &settings.pfsense_rules_interface,
             pfsense_cache_max_age_seconds(settings),
         ) {
             Ok(cache) => {
-                permanent_access_notice = permanent_access_notice(&stdout, &cache);
+                permanent_access_message = permanent_access_notice(&stdout, &cache);
                 message.push_str(&format!(
                     "\nПроверка доступа по кэшу pfSense ({}):\n{}",
                     cache.interface,
@@ -978,8 +978,8 @@ fn run_gui_poll(
                     "ОЗ: {}. Требуется проверка в приложении.",
                     format_pending_announcement(pending, &pending_list)
                 );
-                if let Some(notice) = &permanent_access_notice {
-                    body.push_str("\n");
+                if let Some(notice) = &permanent_access_message {
+                    body.push('\n');
                     body.push_str(notice);
                 }
                 let xmpp_result = std::thread::Builder::new()
@@ -2312,7 +2312,8 @@ fn validate_report_date(date: &str) -> Result<()> {
     let year: u32 = date[0..4].parse()?;
     let month: u32 = date[5..7].parse()?;
     let day: u32 = date[8..10].parse()?;
-    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
     let days_in_month = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
