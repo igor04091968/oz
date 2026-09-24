@@ -2257,25 +2257,44 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
 }
 
 fn validate_report_date(date: &str) -> Result<()> {
-    let valid = date.len() == 10
+    let format_valid = date.len() == 10
         && date.as_bytes()[4] == b'-'
         && date.as_bytes()[7] == b'-'
         && date
             .bytes()
             .enumerate()
             .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit());
-    if !valid {
+    if !format_valid {
         bail!("date must have YYYY-MM-DD format")
+    }
+    let year: u32 = date[0..4].parse()?;
+    let month: u32 = date[5..7].parse()?;
+    let day: u32 = date[8..10].parse()?;
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => 0,
+    };
+    if day == 0 || day > days_in_month {
+        bail!("date must be a valid calendar date in YYYY-MM-DD format")
     }
     Ok(())
 }
 
 fn query_for_report_period(query: &str, period: ReportPeriod, date: &str) -> Result<String> {
-    let end = format!("set @d2 = '{date}';");
+    validate_report_date(date)?;
+    // SQL Server parses YYYYMMDD independently of SET LANGUAGE/DATEFORMAT.
+    let sql_date = date.replace('-', "");
+    let end = format!("set @d2 = convert(date, '{sql_date}', 112);");
     let start = match period {
-        ReportPeriod::Day => format!("set @d1 = '{date}';"),
+        ReportPeriod::Day => format!("set @d1 = convert(date, '{sql_date}', 112);"),
         // Rolling seven calendar days ending on the requested date.
-        ReportPeriod::Week => format!("set @d1 = dateadd(day, -6, '{date}');"),
+        ReportPeriod::Week => format!(
+            "set @d1 = dateadd(day, -6, convert(date, '{sql_date}', 112));"
+        ),
     };
     let mut replaced_start = false;
     let mut replaced_end = false;
@@ -2848,8 +2867,8 @@ mod tests {
     fn report_query_uses_requested_day() {
         let query = "set @d1 = '20260801';\nset @d2 = '20260825';\nselect 1;";
         let actual = query_for_report_period(query, ReportPeriod::Day, "2026-09-01").unwrap();
-        assert!(actual.contains("set @d1 = '2026-09-01';"));
-        assert!(actual.contains("set @d2 = '2026-09-01';"));
+        assert!(actual.contains("set @d1 = convert(date, '20260901', 112);"));
+        assert!(actual.contains("set @d2 = convert(date, '20260901', 112);"));
     }
 
     #[test]
@@ -2869,14 +2888,16 @@ mod tests {
     fn report_query_uses_seven_day_window() {
         let query = "set @d1 = '20260801';\nset @d2 = '20260825';";
         let actual = query_for_report_period(query, ReportPeriod::Week, "2026-09-01").unwrap();
-        assert!(actual.contains("dateadd(day, -6, '2026-09-01')"));
-        assert!(actual.contains("set @d2 = '2026-09-01';"));
+        assert!(actual.contains("dateadd(day, -6, convert(date, '20260901', 112))"));
+        assert!(actual.contains("set @d2 = convert(date, '20260901', 112);"));
     }
 
     #[test]
     fn report_date_format_is_checked() {
         assert!(validate_report_date("2026-09-01").is_ok());
         assert!(validate_report_date("20260901").is_err());
+        assert!(validate_report_date("2026-02-29").is_err());
+        assert!(validate_report_date("2024-02-29").is_ok());
     }
 
     #[test]

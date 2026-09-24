@@ -1,4 +1,4 @@
-declare @d1 datetime, @d2 datetime;
+declare @d1 date, @d2 date;
 
 -- Period when remote-work requests were submitted.
 set @d1 = '20260801';
