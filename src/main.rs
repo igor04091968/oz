@@ -932,16 +932,20 @@ fn run_gui_poll(
         format!("Ошибка ({}).\n{}{}", output.status, stdout, stderr)
     };
 
+    let mut permanent_access_notice = None;
     if settings.pfsense_enabled {
         match load_valid_pfsense_cache(
             &settings.pfsense_rules_interface,
             pfsense_cache_max_age_seconds(settings),
         ) {
-            Ok(cache) => message.push_str(&format!(
-                "\nПроверка доступа по кэшу pfSense ({}):\n{}",
-                cache.interface,
-                format_access_report(&stdout, &cache)
-            )),
+            Ok(cache) => {
+                permanent_access_notice = permanent_access_notice(&stdout, &cache);
+                message.push_str(&format!(
+                    "\nПроверка доступа по кэшу pfSense ({}):\n{}",
+                    cache.interface,
+                    format_access_report(&stdout, &cache)
+                ));
+            }
             Err(error) => message.push_str(&format!(
                 "\nДоступ по pfSense не проверен: кэш недоступен или устарел ({error})"
             )),
@@ -970,10 +974,14 @@ fn run_gui_poll(
                     format_pending_announcement(pending, &pending_list)
                 );
             } else {
-                let body = format!(
+                let mut body = format!(
                     "ОЗ: {}. Требуется проверка в приложении.",
                     format_pending_announcement(pending, &pending_list)
                 );
+                if let Some(notice) = &permanent_access_notice {
+                    body.push_str("\n");
+                    body.push_str(notice);
+                }
                 let xmpp_result = std::thread::Builder::new()
                     .name("oz-xmpp".to_owned())
                     .spawn({
@@ -1840,13 +1848,7 @@ fn format_access_report(output: &str, cache: &PfsenseRuleCache) -> String {
             continue;
         };
         let requester = requester.trim();
-        let key = normalized_requester_key(requester);
-        let matching_rule = key.as_deref().and_then(|key| {
-            cache
-                .rules
-                .iter()
-                .find(|rule| rule.key == key || rule.key.starts_with(&format!("{key}_")))
-        });
+        let matching_rule = pfsense_rule_for_requester(requester, cache);
         let access = match (status, matching_rule) {
             ("processed", Some(rule)) => format!(
                 "доступ разрешён; правило {}; расписание {}",
@@ -1867,6 +1869,46 @@ fn format_access_report(output: &str, cache: &PfsenseRuleCache) -> String {
         "Заявок в текущем SQL-окне нет.".to_owned()
     } else {
         rows.join("\n")
+    }
+}
+
+fn pfsense_rule_for_requester<'a>(
+    requester: &str,
+    cache: &'a PfsenseRuleCache,
+) -> Option<&'a PfsenseRuleGrant> {
+    let key = normalized_requester_key(requester)?;
+    cache
+        .rules
+        .iter()
+        .find(|rule| rule.key == key || rule.key.starts_with(&format!("{key}_")))
+}
+
+fn permanent_access_notice(output: &str, cache: &PfsenseRuleCache) -> Option<String> {
+    let mut employees = Vec::new();
+    for line in output
+        .lines()
+        .filter(|line| line.starts_with("OZ_PENDING_REQUEST "))
+    {
+        let Some((_, requester)) = line
+            .strip_prefix("OZ_PENDING_REQUEST ")
+            .and_then(|fields| fields.split_once(" requester="))
+        else {
+            continue;
+        };
+        let requester = requester.trim();
+        let has_permanent_access = pfsense_rule_for_requester(requester, cache)
+            .is_some_and(|rule| rule.schedule.eq_ignore_ascii_case("AllDay_Worktime"));
+        if has_permanent_access && !employees.iter().any(|name| name == requester) {
+            employees.push(requester.to_owned());
+        }
+    }
+    if employees.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Постоянный OpenVPN-доступ по расписанию AllDay_Worktime уже есть у: {}. Дополнительные изменения правил доступа не требуются.",
+            employees.join(", ")
+        ))
     }
 }
 
@@ -2292,9 +2334,9 @@ fn query_for_report_period(query: &str, period: ReportPeriod, date: &str) -> Res
     let start = match period {
         ReportPeriod::Day => format!("set @d1 = convert(date, '{sql_date}', 112);"),
         // Rolling seven calendar days ending on the requested date.
-        ReportPeriod::Week => format!(
-            "set @d1 = dateadd(day, -6, convert(date, '{sql_date}', 112));"
-        ),
+        ReportPeriod::Week => {
+            format!("set @d1 = dateadd(day, -6, convert(date, '{sql_date}', 112));")
+        }
     };
     let mut replaced_start = false;
     let mut replaced_end = false;
