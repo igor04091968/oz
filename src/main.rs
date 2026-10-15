@@ -127,11 +127,77 @@ struct RemoteWorkRequest {
     request_num: String,
     requester: String,
     por_neisp: i32,
+    assignment_counts: Option<[i32; 8]>,
 }
 
 const REMOTE_WORK_FLOW: &str = "Заявки на удаленную работу";
 
+const ASSIGNMENT_STATUSES: [&str; 8] = [
+    "Получено",
+    "Не получено",
+    "Исполнено",
+    "Согласовано",
+    "Не согласовано",
+    "Принято к сведению",
+    "Ознакомлен",
+    "Неизвестный статус",
+];
+const ASSIGNMENT_COLUMNS: [&str; 8] = [
+    "status_received",
+    "status_not_received",
+    "status_executed",
+    "status_agreed",
+    "status_rejected",
+    "status_noted",
+    "status_read",
+    "status_unknown",
+];
+
 impl RemoteWorkRequest {
+    fn source_status(&self) -> &'static str {
+        let Some(counts) = self.assignment_counts else {
+            // Старый SQL не доказывает завершение: ноль может означать и отказ.
+            return if self.por_neisp != 0 {
+                "waiting"
+            } else {
+                "unknown"
+            };
+        };
+        if counts[4] > 0 {
+            return "rejected";
+        }
+        if counts.iter().all(|count| *count == 0) {
+            return "no_assignments";
+        }
+        if counts[7] > 0 {
+            return "unknown";
+        }
+        if counts[0] > 0 || counts[1] > 0 {
+            return "waiting";
+        }
+        "processed"
+    }
+
+    fn status_details(&self) -> String {
+        match self.assignment_counts {
+            Some(counts) => {
+                let details = ASSIGNMENT_STATUSES
+                    .iter()
+                    .zip(counts)
+                    .filter(|(_, count)| *count > 0)
+                    .map(|(label, count)| format!("{label}: {count}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if details.is_empty() {
+                    "Нет поручений".to_owned()
+                } else {
+                    details
+                }
+            }
+            None => "Старый SQL: детализация статусов отсутствует".to_owned(),
+        }
+    }
+
     fn audit_key(&self) -> String {
         match &self.document_id {
             Some(id) => format!("doc:{id}"),
@@ -1812,6 +1878,16 @@ impl eframe::App for GuiApp {
     }
 }
 
+fn source_status_label(status: &str) -> &str {
+    match status {
+        "processed" => "Завершён",
+        "rejected" => "Отказ",
+        "no_assignments" => "Нет поручений",
+        "unknown" => "Требует проверки",
+        _ => "Ожидает завершения",
+    }
+}
+
 fn report_period_label(period: &str) -> &'static str {
     match period {
         "week" => "Неделя",
@@ -1836,9 +1912,17 @@ fn format_quick_report(output: &str) -> Option<String> {
         let Some((number, rest)) = fields.split_once(" requester=") else {
             continue;
         };
-        let Some(requester) = rest.strip_suffix(" status=processed") else {
+        let Some((requester, status)) = rest.rsplit_once(" status=") else {
             continue;
         };
+        let (requester, details) = requester
+            .split_once(" details=")
+            .map_or((requester, None), |(author, details)| {
+                (author, Some(details))
+            });
+        if status != "processed" && details.is_none() {
+            continue;
+        }
         let (number, flow) = request_output_identity(number);
         if !number.is_empty() {
             let requester = if requester.trim().is_empty() {
@@ -1847,7 +1931,10 @@ fn format_quick_report(output: &str) -> Option<String> {
                 requester.trim()
             };
             let flow_label = flow.map(|name| format!(" [{name}]")).unwrap_or_default();
-            entries.push(format!("№ {number}{flow_label} — {requester}"));
+            let suffix = details
+                .map(|details| format!(" — {} ({details})", source_status_label(status)))
+                .unwrap_or_default();
+            entries.push(format!("№ {number}{flow_label} — {requester}{suffix}"));
         }
     }
 
@@ -1855,7 +1942,11 @@ fn format_quick_report(output: &str) -> Option<String> {
     if entries.is_empty() {
         report.push_str("Обработанные заявки: нет");
     } else {
-        report.push_str("Обработанные заявки:\n");
+        report.push_str(if output.contains(" details=") {
+            "Документы и статусы:\n"
+        } else {
+            "Обработанные заявки:\n"
+        });
         report.push_str(&entries.join("\n"));
     }
     Some(report)
@@ -1896,6 +1987,11 @@ fn format_access_report(output: &str, cache: &PfsenseRuleCache) -> String {
                 rule.description, rule.schedule
             ),
             ("processed", None) => "доступ запрещён: разрешающее правило не найдено".to_owned(),
+            ("rejected", _) => "отказ в согласовании".to_owned(),
+            ("unknown", _) => {
+                "статус требует проверки; обновите SQL при отсутствии детализации".to_owned()
+            }
+            ("no_assignments", _) => "поручений нет; согласование не подтверждено".to_owned(),
             ("approved", _) => "заявка согласована, но ещё не обработана".to_owned(),
             _ => "заявка ожидает обработки".to_owned(),
         };
@@ -2189,14 +2285,17 @@ fn load_config(path: &str) -> Result<AppConfig> {
     toml::from_str(&raw).with_context(|| format!("parse config {path}"))
 }
 
-// Обработка заявок получает свежие данные, исключает уже обработанные записи
-// и фиксирует согласованные заявки в локальном аудите. pfSense при этом не
-// изменяется: доступ проверяется GUI по ранее сохраненному кэшу правил.
+// Обработка документов получает текущие статусы поручений из MSSQL
+// и сохраняет последний результат в аудите. pfSense при этом не изменяется:
+// доступ проверяется GUI по ранее сохраненному кэшу правил.
 async fn process_requests(config: &AppConfig) -> Result<()> {
     let requests_config = config
         .requests
         .as_ref()
         .context("requests section is required for process-requests")?;
+    if requests_config.mark_unapproved_as_seen {
+        warn!("mark_unapproved_as_seen устарел: состояние поручений берётся из MSSQL");
+    }
     let audit = Audit::open(&config.runtime.audit_db_path)?;
     let source_query = fs::read_to_string(&requests_config.query_file)
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
@@ -2204,18 +2303,22 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
 
     info!(count = requests.len(), "fetched tracked documents");
-    let mut pending_requests = Vec::new();
-    for request in &requests {
-        // Необработанной считаем именно заявку с неисполненным поручением.
-        // por_neisp из MSSQL является источником истины для этого статуса.
-        if request.por_neisp != 0 && !audit.is_request_processed(request)? {
-            pending_requests.push(request);
-        }
-    }
+    // Только текущее состояние MSSQL определяет очередь, старый аудит её не скрывает.
+    let pending_requests = requests
+        .iter()
+        .filter(|request| !matches!(request.source_status(), "processed" | "rejected"))
+        .collect::<Vec<_>>();
     // Отпечаток набора используется GUI для подавления повторных уведомлений.
     let mut pending_keys = pending_requests
         .iter()
-        .map(|request| request.audit_key())
+        .map(|request| {
+            format!(
+                "{}:{}:{}",
+                request.audit_key(),
+                request.source_status(),
+                request.status_details()
+            )
+        })
         .collect::<Vec<_>>();
     pending_keys.sort();
     let pending_fingerprint = pending_keys.join("\n");
@@ -2241,52 +2344,19 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     }
 
     for request in &requests {
-        let status = if audit.is_request_processed(request)? {
-            "processed"
-        } else if request.por_neisp != 0 {
-            "waiting"
-        } else {
-            audit.record_request_processed(request)?;
-            "processed"
-        };
+        let status = request.source_status();
+        // Аудит отражает свежий результат, в том числе повторное открытие/отказ.
+        audit.record_request_status(request, status)?;
         println!(
             "OZ_ACCESS_REQUEST num={} flow={} requester={} status={status}",
             request.request_num, request.flow_name, request.requester
         );
-    }
-
-    for request in requests {
-        if audit.is_request_processed(&request)? {
-            info!(
-                request_num = request.request_num,
-                flow_name = request.flow_name,
-                "request already processed"
-            );
-            continue;
-        }
-
-        // Наличие неисполненного поручения означает, что согласование не готово.
-        // По умолчанию такая заявка остается видимой для следующего опроса.
-        if request.por_neisp != 0 {
-            warn!(
-                request_num = request.request_num,
-                flow_name = request.flow_name,
-                requester = request.requester,
-                por_neisp = request.por_neisp,
-                "request approval is incomplete"
-            );
-            if requests_config.mark_unapproved_as_seen {
-                audit.record_request_status(&request, "approval_incomplete")?;
-            }
-            continue;
-        }
-
-        audit.record_request_processed(&request)?;
         info!(
             request_num = request.request_num,
             flow_name = request.flow_name,
-            requester = request.requester,
-            "approved request processed by OZ"
+            status,
+            details = request.status_details(),
+            "document source status"
         );
     }
 
@@ -2307,27 +2377,25 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
 
     let mut processed = 0usize;
     let mut waiting = 0usize;
+    let mut rejected = 0usize;
     let mut rows = Vec::with_capacity(requests.len());
     for request in requests {
-        // Источник истины для исполнения — por_neisp из MSSQL. Локальный
-        // аудит не подменяет этот статус и нужен для повторных запусков OZ.
-        let status = if request.por_neisp == 0 {
-            processed += 1;
-            "processed"
-        } else {
-            waiting += 1;
-            "waiting"
-        };
+        let status = request.source_status();
+        match status {
+            "processed" => processed += 1,
+            "rejected" => rejected += 1,
+            _ => waiting += 1,
+        }
         rows.push((
-            request.request_num,
-            request.flow_name,
-            request.requester,
+            request.request_num.clone(),
+            request.flow_name.clone(),
+            request.requester.clone(),
             status,
+            request.status_details(),
         ));
     }
-
     println!(
-        "OZ_REPORT period={} anchor_date={} total={} processed={} waiting={}",
+        "OZ_REPORT period={} anchor_date={} total={} processed={} waiting={} rejected={}",
         match period {
             ReportPeriod::Day => "day",
             ReportPeriod::Week => "week",
@@ -2335,14 +2403,16 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
         date,
         rows.len(),
         processed,
-        waiting
+        waiting,
+        rejected
     );
-    for (number, flow, requester, status) in rows {
+    for (number, flow, requester, status, details) in rows {
         println!(
-            "OZ_REQUEST num={} flow={} requester={} status={status}",
-            number, flow, requester
+            "OZ_REQUEST num={} flow={} requester={} details={} status={status}",
+            number, flow, requester, details
         );
     }
+
     Ok(())
 }
 
@@ -2747,6 +2817,28 @@ impl PfsenseClient {
 }
 
 fn remote_work_request_from_row(row: tiberius::Row) -> Result<RemoteWorkRequest> {
+    let present = ASSIGNMENT_COLUMNS
+        .iter()
+        .filter(|name| row.columns().iter().any(|column| column.name() == **name))
+        .count();
+    let assignment_counts = if present == 0 {
+        None
+    } else {
+        if present != ASSIGNMENT_COLUMNS.len() {
+            bail!("SQL: неполный набор колонок статусов поручений");
+        }
+        let mut counts = [0; 8];
+        for (index, name) in ASSIGNMENT_COLUMNS.iter().enumerate() {
+            let value = row
+                .try_get::<i32, _>(*name)?
+                .with_context(|| format!("SQL: NULL в {name}"))?;
+            if value < 0 {
+                bail!("SQL: отрицательный счётчик {name}");
+            }
+            counts[index] = value;
+        }
+        Some(counts)
+    };
     Ok(RemoteWorkRequest {
         document_id: get_optional_str(&row, "document_id").filter(|id| !id.is_empty()),
         flow_name: get_optional_str(&row, "flow_name")
@@ -2754,7 +2846,12 @@ fn remote_work_request_from_row(row: tiberius::Row) -> Result<RemoteWorkRequest>
             .unwrap_or_else(|| REMOTE_WORK_FLOW.to_owned()),
         request_num: get_required_str(&row, "num1")?,
         requester: get_required_str(&row, "ot_kogo")?,
-        por_neisp: row.get::<i32, _>("por_neisp").unwrap_or(1),
+        por_neisp: row
+            .try_get::<i32, _>("por_neisp")
+            .ok()
+            .flatten()
+            .unwrap_or(1),
+        assignment_counts,
     })
 }
 
@@ -2875,6 +2972,7 @@ impl Audit {
         Ok(Self { conn })
     }
 
+    #[cfg(test)]
     fn is_request_processed(&self, request: &RemoteWorkRequest) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "select count(*) from tracked_documents where request_key = ?1 and status = 'processed'",
@@ -2897,6 +2995,7 @@ impl Audit {
         Ok(false)
     }
 
+    #[cfg(test)]
     fn record_request_processed(&self, request: &RemoteWorkRequest) -> Result<()> {
         self.record_request_status(request, "processed")
     }
@@ -2921,7 +3020,88 @@ mod tests {
             request_num: number.to_owned(),
             requester: "Иванов Иван Иванович".to_owned(),
             por_neisp: 1,
+            assignment_counts: None,
         }
+    }
+
+    #[test]
+    fn assignment_status_rules_cover_all_seven_states_and_empty_documents() {
+        let mut request = tracked_document(Some("1:77"), REMOTE_WORK_FLOW, "77");
+        for (index, expected) in [
+            "waiting",
+            "waiting",
+            "processed",
+            "processed",
+            "rejected",
+            "processed",
+            "processed",
+            "unknown",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut counts = [0; 8];
+            counts[index] = 1;
+            request.assignment_counts = Some(counts);
+            assert_eq!(
+                request.source_status(),
+                *expected,
+                "{}",
+                ASSIGNMENT_STATUSES[index]
+            );
+            assert!(
+                request
+                    .status_details()
+                    .contains(ASSIGNMENT_STATUSES[index])
+            );
+        }
+        request.assignment_counts = Some([0; 8]);
+        assert_eq!(request.source_status(), "no_assignments");
+        request.assignment_counts = Some([0, 0, 2, 1, 0, 3, 1, 0]);
+        assert_eq!(request.source_status(), "processed");
+        request.assignment_counts = Some([1, 0, 2, 1, 0, 3, 1, 0]);
+        assert_eq!(request.source_status(), "waiting");
+        request.assignment_counts = Some([1, 0, 2, 1, 1, 3, 1, 1]);
+        assert_eq!(request.source_status(), "rejected");
+        request.assignment_counts = Some([0, 0, 2, 1, 0, 3, 1, 1]);
+        assert_eq!(request.source_status(), "unknown");
+    }
+
+    #[test]
+    fn old_sql_cannot_prove_approval_and_audit_cannot_override_source() {
+        let audit = Audit::open(":memory:").unwrap();
+        for flow in [
+            REMOTE_WORK_FLOW,
+            "Служебные записки",
+            "Запросы на права",
+            "Согласие на работу в выходные дни",
+        ] {
+            let mut request = tracked_document(Some("1:77"), flow, "77");
+            request.por_neisp = 0;
+            assert_eq!(request.source_status(), "unknown");
+            audit.record_request_processed(&request).unwrap();
+            request.assignment_counts = Some([1, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(request.source_status(), "waiting");
+            audit
+                .record_request_status(&request, request.source_status())
+                .unwrap();
+            assert!(!audit.is_request_processed(&request).unwrap());
+            request.assignment_counts = Some([0, 0, 0, 0, 1, 0, 0, 0]);
+            assert_eq!(request.source_status(), "rejected");
+        }
+    }
+
+    #[test]
+    fn quick_report_displays_refusal_and_actual_assignment_details() {
+        let report = format_quick_report(concat!(
+            "OZ_REPORT total=3 processed=1 waiting=1 rejected=1\n",
+            "OZ_REQUEST num=1 flow=Запросы на права requester=Иванов details=Не согласовано: 1 status=rejected\n",
+            "OZ_REQUEST num=2 flow=Служебные записки requester= details=Нет поручений status=no_assignments\n",
+            "OZ_REQUEST num=3 flow=Служебные записки requester=Петров details=Ознакомлен: 2 status=processed\n",
+        )).unwrap();
+        assert!(report.contains("Отказ (Не согласовано: 1)"));
+        assert!(report.contains("автор не указан — Нет поручений"));
+        assert!(report.contains("Завершён (Ознакомлен: 2)"));
     }
 
     #[test]
