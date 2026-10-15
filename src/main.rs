@@ -1,6 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-//! ОЗ — небольшой оркестратор заявок на удаленную работу.
+//! ОЗ — отслеживание документов в выбранных потоках и уведомления.
 //!
 //! Программа имеет два сценария запуска:
 //! - CLI для проверки заявок;
@@ -122,9 +122,32 @@ fn default_poll_lookback_days() -> u32 {
 
 #[derive(Debug, Clone)]
 struct RemoteWorkRequest {
+    document_id: Option<String>,
+    flow_name: String,
     request_num: String,
     requester: String,
     por_neisp: i32,
+}
+
+const REMOTE_WORK_FLOW: &str = "Заявки на удаленную работу";
+
+impl RemoteWorkRequest {
+    fn audit_key(&self) -> String {
+        match &self.document_id {
+            Some(id) => format!("doc:{id}"),
+            // Старые пользовательские SQL-файлы могут не возвращать document_id.
+            None => format!(
+                "flow:{}:{}:{}",
+                self.flow_name.len(),
+                self.flow_name,
+                self.request_num
+            ),
+        }
+    }
+
+    fn display_number(&self) -> String {
+        format!("{} ({})", self.request_num, self.flow_name)
+    }
 }
 
 const PFSENSE_CACHE_TTL_SECONDS: u64 = 3600;
@@ -1816,9 +1839,15 @@ fn format_quick_report(output: &str) -> Option<String> {
         let Some(requester) = rest.strip_suffix(" status=processed") else {
             continue;
         };
-        let number = number.trim().strip_prefix("num=").unwrap_or(number.trim());
-        if !number.is_empty() && !requester.trim().is_empty() {
-            entries.push(format!("№ {number} — {}", requester.trim()));
+        let (number, flow) = request_output_identity(number);
+        if !number.is_empty() {
+            let requester = if requester.trim().is_empty() {
+                "автор не указан"
+            } else {
+                requester.trim()
+            };
+            let flow_label = flow.map(|name| format!(" [{name}]")).unwrap_or_default();
+            entries.push(format!("№ {number}{flow_label} — {requester}"));
         }
     }
 
@@ -1830,6 +1859,14 @@ fn format_quick_report(output: &str) -> Option<String> {
         report.push_str(&entries.join("\n"));
     }
     Some(report)
+}
+
+fn request_output_identity(fields: &str) -> (&str, Option<&str>) {
+    let fields = fields.trim().strip_prefix("num=").unwrap_or(fields.trim());
+    match fields.split_once(" flow=") {
+        Some((number, flow)) => (number.trim(), Some(flow.trim())),
+        None => (fields, None),
+    }
 }
 
 fn format_access_report(output: &str, cache: &PfsenseRuleCache) -> String {
@@ -1847,6 +1884,10 @@ fn format_access_report(output: &str, cache: &PfsenseRuleCache) -> String {
         let Some((requester, status)) = rest.rsplit_once(" status=") else {
             continue;
         };
+        let (number, flow) = request_output_identity(number);
+        if flow.is_some_and(|name| name != REMOTE_WORK_FLOW) {
+            continue;
+        }
         let requester = requester.trim();
         let matching_rule = pfsense_rule_for_requester(requester, cache);
         let access = match (status, matching_rule) {
@@ -1858,15 +1899,10 @@ fn format_access_report(output: &str, cache: &PfsenseRuleCache) -> String {
             ("approved", _) => "заявка согласована, но ещё не обработана".to_owned(),
             _ => "заявка ожидает обработки".to_owned(),
         };
-        rows.push(format!(
-            "№ {} — {}: {}",
-            number.trim().trim_start_matches("num="),
-            requester,
-            access
-        ));
+        rows.push(format!("№ {} — {}: {}", number, requester, access));
     }
     if rows.is_empty() {
-        "Заявок в текущем SQL-окне нет.".to_owned()
+        "Заявок на удалённую работу в текущем SQL-окне нет.".to_owned()
     } else {
         rows.join("\n")
     }
@@ -1889,12 +1925,16 @@ fn permanent_access_notice(output: &str, cache: &PfsenseRuleCache) -> Option<Str
         .lines()
         .filter(|line| line.starts_with("OZ_PENDING_REQUEST "))
     {
-        let Some((_, requester)) = line
+        let Some((identity, requester)) = line
             .strip_prefix("OZ_PENDING_REQUEST ")
             .and_then(|fields| fields.split_once(" requester="))
         else {
             continue;
         };
+        let (_, flow) = request_output_identity(identity);
+        if flow.is_some_and(|name| name != REMOTE_WORK_FLOW) {
+            continue;
+        }
         let requester = requester.trim();
         let has_permanent_access = pfsense_rule_for_requester(requester, cache)
             .is_some_and(|rule| rule.schedule.eq_ignore_ascii_case("AllDay_Worktime"));
@@ -2163,21 +2203,22 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     let query = query_for_poll_lookback(&source_query, requests_config.poll_lookback_days)?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
 
-    info!(count = requests.len(), "fetched remote work requests");
+    info!(count = requests.len(), "fetched tracked documents");
     let mut pending_requests = Vec::new();
     for request in &requests {
         // Необработанной считаем именно заявку с неисполненным поручением.
         // por_neisp из MSSQL является источником истины для этого статуса.
-        if request.por_neisp != 0 && !audit.is_request_processed(&request.request_num)? {
+        if request.por_neisp != 0 && !audit.is_request_processed(request)? {
             pending_requests.push(request);
         }
     }
     // Отпечаток набора используется GUI для подавления повторных уведомлений.
-    let pending_fingerprint = pending_requests
+    let mut pending_keys = pending_requests
         .iter()
-        .map(|request| request.request_num.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|request| request.audit_key())
+        .collect::<Vec<_>>();
+    pending_keys.sort();
+    let pending_fingerprint = pending_keys.join("\n");
     println!(
         "OZ_RESULT fetched={} pending={} fingerprint={}",
         requests.len(),
@@ -2188,19 +2229,19 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
         "OZ_PENDING_NUMS {}",
         pending_requests
             .iter()
-            .map(|request| request.request_num.as_str())
+            .map(|request| request.display_number())
             .collect::<Vec<_>>()
             .join(",")
     );
     for request in &pending_requests {
         println!(
-            "OZ_PENDING_REQUEST num={} requester={}",
-            request.request_num, request.requester
+            "OZ_PENDING_REQUEST num={} flow={} requester={}",
+            request.request_num, request.flow_name, request.requester
         );
     }
 
     for request in &requests {
-        let status = if audit.is_request_processed(&request.request_num)? {
+        let status = if audit.is_request_processed(request)? {
             "processed"
         } else if request.por_neisp != 0 {
             "waiting"
@@ -2209,15 +2250,16 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
             "processed"
         };
         println!(
-            "OZ_ACCESS_REQUEST num={} requester={} status={status}",
-            request.request_num, request.requester
+            "OZ_ACCESS_REQUEST num={} flow={} requester={} status={status}",
+            request.request_num, request.flow_name, request.requester
         );
     }
 
     for request in requests {
-        if audit.is_request_processed(&request.request_num)? {
+        if audit.is_request_processed(&request)? {
             info!(
                 request_num = request.request_num,
+                flow_name = request.flow_name,
                 "request already processed"
             );
             continue;
@@ -2228,12 +2270,13 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
         if request.por_neisp != 0 {
             warn!(
                 request_num = request.request_num,
+                flow_name = request.flow_name,
                 requester = request.requester,
                 por_neisp = request.por_neisp,
                 "request approval is incomplete"
             );
             if requests_config.mark_unapproved_as_seen {
-                audit.record_request_skipped(&request, "approval_incomplete")?;
+                audit.record_request_status(&request, "approval_incomplete")?;
             }
             continue;
         }
@@ -2241,6 +2284,7 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
         audit.record_request_processed(&request)?;
         info!(
             request_num = request.request_num,
+            flow_name = request.flow_name,
             requester = request.requester,
             "approved request processed by OZ"
         );
@@ -2249,8 +2293,7 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-// Отчет намеренно выводит только номера и технические статусы. ФИО, причины
-// удаленной работы и другие поля заявки в консольный результат не попадают.
+// Отчет выводит номер, поток, автора и статус без содержимого документов.
 async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -> Result<()> {
     validate_report_date(date)?;
     let requests_config = config
@@ -2275,7 +2318,12 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
             waiting += 1;
             "waiting"
         };
-        rows.push((request.request_num, request.requester, status));
+        rows.push((
+            request.request_num,
+            request.flow_name,
+            request.requester,
+            status,
+        ));
     }
 
     println!(
@@ -2289,10 +2337,10 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
         processed,
         waiting
     );
-    for (number, requester, status) in rows {
+    for (number, flow, requester, status) in rows {
         println!(
-            "OZ_REQUEST num={} requester={} status={status}",
-            number, requester
+            "OZ_REQUEST num={} flow={} requester={} status={status}",
+            number, flow, requester
         );
     }
     Ok(())
@@ -2412,7 +2460,7 @@ async fn fetch_remote_work_requests(
     let rows = client
         .simple_query(query)
         .await
-        .context("execute MSSQL remote-work query")?
+        .context("execute MSSQL tracked-document query")?
         .into_results()
         .await
         .context("read MSSQL request rows")?;
@@ -2700,6 +2748,10 @@ impl PfsenseClient {
 
 fn remote_work_request_from_row(row: tiberius::Row) -> Result<RemoteWorkRequest> {
     Ok(RemoteWorkRequest {
+        document_id: get_optional_str(&row, "document_id").filter(|id| !id.is_empty()),
+        flow_name: get_optional_str(&row, "flow_name")
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| REMOTE_WORK_FLOW.to_owned()),
         request_num: get_required_str(&row, "num1")?,
         requester: get_required_str(&row, "ot_kogo")?,
         por_neisp: row.get::<i32, _>("por_neisp").unwrap_or(1),
@@ -2779,7 +2831,10 @@ fn get_required_str(row: &tiberius::Row, name: &str) -> Result<String> {
 }
 
 fn get_optional_str(row: &tiberius::Row, name: &str) -> Option<String> {
-    row.get::<&str, _>(name).map(str::to_owned)
+    row.try_get::<&str, _>(name)
+        .ok()
+        .flatten()
+        .map(str::to_owned)
 }
 
 fn hash_pending_requests(request_numbers: &str) -> String {
@@ -2805,33 +2860,51 @@ impl Audit {
                 rule_key text,
                 status text not null,
                 processed_at text not null default current_timestamp
+            );
+            create table if not exists tracked_documents (
+                request_key text primary key,
+                document_id text,
+                flow_name text not null,
+                request_num text not null,
+                requester text not null,
+                status text not null,
+                processed_at text not null default current_timestamp
             );",
         )
         .context("migrate audit DB")?;
         Ok(Self { conn })
     }
 
-    fn is_request_processed(&self, request_num: &str) -> Result<bool> {
+    fn is_request_processed(&self, request: &RemoteWorkRequest) -> Result<bool> {
         let count: i64 = self.conn.query_row(
-            "select count(*) from processed_requests where request_num = ?1 and status = 'processed'",
-            params![request_num],
+            "select count(*) from tracked_documents where request_key = ?1 and status = 'processed'",
+            params![request.audit_key()],
             |row| row.get(0),
         )?;
-        Ok(count > 0)
+        if count > 0 {
+            return Ok(true);
+        }
+        // Старый аудит относится только к потоку удалённой работы. Его номера
+        // не должны скрывать документы новых потоков с совпадающим номером.
+        if request.flow_name == REMOTE_WORK_FLOW {
+            let legacy_count: i64 = self.conn.query_row(
+                "select count(*) from processed_requests where request_num = ?1 and status = 'processed'",
+                params![request.request_num],
+                |row| row.get(0),
+            )?;
+            return Ok(legacy_count > 0);
+        }
+        Ok(false)
     }
 
     fn record_request_processed(&self, request: &RemoteWorkRequest) -> Result<()> {
-        self.conn.execute(
-            "insert or replace into processed_requests (request_num, requester, rule_key, status) values (?1, ?2, null, 'processed')",
-            params![request.request_num, request.requester],
-        )?;
-        Ok(())
+        self.record_request_status(request, "processed")
     }
 
-    fn record_request_skipped(&self, request: &RemoteWorkRequest, status: &str) -> Result<()> {
+    fn record_request_status(&self, request: &RemoteWorkRequest, status: &str) -> Result<()> {
         self.conn.execute(
-            "insert or replace into processed_requests (request_num, requester, rule_key, status) values (?1, ?2, null, ?3)",
-            params![request.request_num, request.requester, status],
+            "insert or replace into tracked_documents (request_key, document_id, flow_name, request_num, requester, status) values (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![request.audit_key(), request.document_id, request.flow_name, request.request_num, request.requester, status],
         )?;
         Ok(())
     }
@@ -2840,6 +2913,123 @@ impl Audit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tracked_document(id: Option<&str>, flow: &str, number: &str) -> RemoteWorkRequest {
+        RemoteWorkRequest {
+            document_id: id.map(str::to_owned),
+            flow_name: flow.to_owned(),
+            request_num: number.to_owned(),
+            requester: "Иванов Иван Иванович".to_owned(),
+            por_neisp: 1,
+        }
+    }
+
+    #[test]
+    fn audit_keeps_same_numbers_in_different_documents_independent() {
+        let audit = Audit::open(":memory:").unwrap();
+        let remote = tracked_document(Some("1:100"), REMOTE_WORK_FLOW, "42");
+        let memo = tracked_document(Some("1:101"), "Служебные записки", "42");
+        let second_memo = tracked_document(Some("2:101"), "Служебные записки", "42");
+        audit.record_request_processed(&remote).unwrap();
+        assert!(audit.is_request_processed(&remote).unwrap());
+        assert!(!audit.is_request_processed(&memo).unwrap());
+        audit.record_request_processed(&memo).unwrap();
+        assert!(audit.is_request_processed(&memo).unwrap());
+        assert!(!audit.is_request_processed(&second_memo).unwrap());
+        audit
+            .record_request_status(&second_memo, "approval_incomplete")
+            .unwrap();
+        assert!(!audit.is_request_processed(&second_memo).unwrap());
+        audit.record_request_processed(&second_memo).unwrap();
+        assert!(audit.is_request_processed(&second_memo).unwrap());
+    }
+
+    #[test]
+    fn legacy_audit_applies_only_to_remote_work_flow() {
+        let audit = Audit::open(":memory:").unwrap();
+        audit.conn.execute(
+            "insert into processed_requests (request_num, requester, status) values ('42', 'Иванов', 'processed')",
+            [],
+        ).unwrap();
+        for flow in [
+            "Служебные записки",
+            "Запросы на права",
+            "Согласие на работу в выходные дни",
+        ] {
+            let request = tracked_document(Some("1:101"), flow, "42");
+            assert!(!audit.is_request_processed(&request).unwrap());
+        }
+        let remote = tracked_document(Some("1:100"), REMOTE_WORK_FLOW, "42");
+        assert!(audit.is_request_processed(&remote).unwrap());
+        let count: i64 = audit
+            .conn
+            .query_row("select count(*) from processed_requests", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn fallback_identity_and_notifications_distinguish_flows() {
+        let remote = tracked_document(None, REMOTE_WORK_FLOW, "42");
+        let memo = tracked_document(None, "Служебные записки", "42");
+        assert_ne!(remote.audit_key(), memo.audit_key());
+        assert_ne!(
+            hash_pending_requests(&remote.audit_key()),
+            hash_pending_requests(&memo.audit_key())
+        );
+        let announcement = format_pending_announcement(1, &memo.display_number());
+        assert!(announcement.contains("42 (Служебные записки)"));
+    }
+
+    #[test]
+    fn quick_report_distinguishes_same_numbers_and_missing_author() {
+        let output = concat!(
+            "OZ_REPORT period=day total=2 processed=2 waiting=0\n",
+            "OZ_REQUEST num=42 flow=Служебные записки requester=Иванов status=processed\n",
+            "OZ_REQUEST num=42 flow=Запросы на права requester= status=processed\n",
+        );
+        let report = format_quick_report(output).unwrap();
+        assert!(report.contains("№ 42 [Служебные записки] — Иванов"));
+        assert!(report.contains("№ 42 [Запросы на права] — автор не указан"));
+    }
+
+    #[test]
+    fn pfsense_checks_only_remote_work_documents() {
+        let cache = PfsenseRuleCache {
+            schema_version: 1,
+            created_at: 0,
+            interface: "openvpn".to_owned(),
+            rules: vec![PfsenseRuleGrant {
+                key: "ivanov_ii_syk83".to_owned(),
+                description: "ivanov_ii_syk83".to_owned(),
+                source: "any".to_owned(),
+                destination: "any".to_owned(),
+                schedule: "AllDay_Worktime".to_owned(),
+            }],
+        };
+        for flow in [
+            "Служебные записки",
+            "Запросы на права",
+            "Согласие на работу в выходные дни",
+        ] {
+            let output = format!(
+                "OZ_ACCESS_REQUEST num=42 flow={flow} requester=Иванов Иван Иванович status=processed\nOZ_PENDING_REQUEST num=42 flow={flow} requester=Иванов Иван Иванович\n"
+            );
+            assert!(!format_access_report(&output, &cache).contains("доступ разрешён"));
+            assert!(permanent_access_notice(&output, &cache).is_none());
+        }
+        let output = format!(
+            "OZ_ACCESS_REQUEST num=42 flow={REMOTE_WORK_FLOW} requester=Иванов Иван Иванович status=processed\nOZ_PENDING_REQUEST num=42 flow={REMOTE_WORK_FLOW} requester=Иванов Иван Иванович\n"
+        );
+        assert!(format_access_report(&output, &cache).contains("доступ разрешён"));
+        assert!(
+            permanent_access_notice(&output, &cache)
+                .unwrap()
+                .contains("Иванов Иван Иванович")
+        );
+    }
 
     #[test]
     fn gui_startup_arguments_preserve_data_directory() {
