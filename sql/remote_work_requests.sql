@@ -9,7 +9,7 @@ select
     rtrim(p.name) as flow_name,                  -- document flow
     convert(varchar(10), d.date1, 23) as date_z,  -- request date
     convert(varchar(64), d.num1) as num1,          -- request number
-    rtrim(isnull(d.pole4, N'')) as ot_kogo, -- existing author mapping; may be empty
+    rtrim(isnull(u.name, N'')) as ot_kogo, -- document author from users table
     convert(varchar(10), d.date3, 23) as date_n,  -- first remote-work day
     rtrim(d.pole3) as time_n,              -- time period on first day
     convert(varchar(10), d.date2, 23) as date_k,  -- last day, empty for one-day requests
@@ -26,6 +26,7 @@ select
     statuses.status_unknown
 from docum d
 inner join potok p on p.id = d.id_potok
+inner join users u on u.id = d.id_contr
 outer apply (
     select
         count(case when ltrim(rtrim(isnull(por.ispol, N''))) = N'Получено' then 1 end) as status_received,
@@ -49,4 +50,5 @@ where d.date1 >= @d1
       N'Запросы на права',
       N'Согласие на работу в выходные дни'
   )
+-- {{AUTHOR_EXCLUSION_FILTER}}
 order by d.date1, d.id_filial, d.id;

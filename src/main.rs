@@ -2314,6 +2314,7 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     let source_query = fs::read_to_string(&requests_config.query_file)
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
     let query = query_for_poll_lookback(&source_query, requests_config.poll_lookback_days)?;
+    let query = apply_author_exclusions_to_query(&query, &requests_config.excluded_authors)?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
     let excluded = requests
         .iter()
@@ -2400,6 +2401,7 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
     let source_query = fs::read_to_string(&requests_config.query_file)
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
     let query = query_for_report_period(&source_query, period, date)?;
+    let query = apply_author_exclusions_to_query(&query, &requests_config.excluded_authors)?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
     let requests = requests
         .into_iter()
@@ -2534,7 +2536,44 @@ fn parse_author_exclusions(value: &str) -> Vec<String> {
 
 fn is_excluded_author(requester: &str, exclusions: &[String]) -> bool {
     let author = normalize_author_search(requester);
-    !author.is_empty() && exclusions.iter().any(|part| author.contains(part))
+    !author.is_empty()
+        && exclusions
+            .iter()
+            .map(|part| normalize_author_search(part))
+            .filter(|part| !part.is_empty())
+            .any(|part| author.contains(&part))
+}
+
+fn apply_author_exclusions_to_query(query: &str, exclusions: &[String]) -> Result<String> {
+    const MARKER: &str = "-- {{AUTHOR_EXCLUSION_FILTER}}";
+    let occurrences = query.matches(MARKER).count();
+    if occurrences == 0 {
+        // User-provided legacy SQL can still use the Rust-side fallback filter.
+        return Ok(query.to_owned());
+    }
+    if occurrences != 1 {
+        bail!("request SQL must contain exactly one author exclusion marker");
+    }
+
+    let fragments = exclusions
+        .iter()
+        .map(|part| normalize_author_search(part))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let predicate = if fragments.is_empty() {
+        String::new()
+    } else {
+        let conditions = fragments
+            .iter()
+            .map(|part| {
+                let escaped = part.replace('\'', "''");
+                format!("charindex(N'{escaped}', isnull(u.name, N'')) > 0")
+            })
+            .collect::<Vec<_>>()
+            .join(" or ");
+        format!("and not ({conditions})")
+    };
+    Ok(query.replace(MARKER, &predicate))
 }
 
 fn query_for_poll_lookback(query: &str, lookback_days: u32) -> Result<String> {
