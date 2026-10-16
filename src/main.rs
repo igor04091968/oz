@@ -114,6 +114,8 @@ struct RequestsConfig {
     mark_unapproved_as_seen: bool,
     #[serde(default = "default_poll_lookback_days")]
     poll_lookback_days: u32,
+    #[serde(default)]
+    excluded_authors: Vec<String>,
 }
 
 fn default_poll_lookback_days() -> u32 {
@@ -333,6 +335,7 @@ struct GuiSettings {
     config_path: String,
     poll_interval_seconds: String,
     poll_lookback_days: String,
+    excluded_authors: String,
     poll_enabled: bool,
     sql_server: String,
     sql_port: String,
@@ -374,6 +377,7 @@ impl Default for GuiSettings {
             config_path: "config.toml".to_owned(),
             poll_interval_seconds: "60".to_owned(),
             poll_lookback_days: "30".to_owned(),
+            excluded_authors: String::new(),
             poll_enabled: true,
             sql_server: "srv-db".to_owned(),
             sql_port: "1433".to_owned(),
@@ -1704,6 +1708,14 @@ impl eframe::App for GuiApp {
                         "Глубина выборки, дней",
                         &mut self.settings.poll_lookback_days,
                     );
+                    ui.label("Исключать авторов (часть имени или фамилии, по одному на строку)");
+                    ui.add(
+                        eframe::egui::TextEdit::multiline(&mut self.settings.excluded_authors)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3)
+                            .hint_text("Например: Иванов\nПетрова Ольга"),
+                    );
+                    ui.small("Исключённые заявки не попадают в оповещения, отчёты и автодозвон.");
                     ui.separator();
                     ui.label(eframe::egui::RichText::new("Файлы и аудит").strong());
                     text_field(ui, "Конфигурация", &mut self.settings.config_path);
@@ -2177,6 +2189,7 @@ query_file = "{}"
 query_file = {:?}
 mark_unapproved_as_seen = false
 poll_lookback_days = {}
+excluded_authors = {:?}
 
 [pfsense]
 base_url = {:?}
@@ -2198,6 +2211,7 @@ skip_tls_verify = {}
             .parse::<u32>()
             .unwrap_or(default_poll_lookback_days())
             .max(1),
+        parse_author_exclusions(&settings.excluded_authors),
         settings.pfsense_url,
         settings
             .pfsense_timeout_seconds
@@ -2301,8 +2315,21 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
     let query = query_for_poll_lookback(&source_query, requests_config.poll_lookback_days)?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
+    let excluded = requests
+        .iter()
+        .filter(|request| is_excluded_author(&request.requester, &requests_config.excluded_authors))
+        .count();
+    let requests = requests
+        .into_iter()
+        .filter(|request| {
+            !is_excluded_author(&request.requester, &requests_config.excluded_authors)
+        })
+        .collect::<Vec<_>>();
 
-    info!(count = requests.len(), "fetched tracked documents");
+    info!(
+        count = requests.len(),
+        excluded, "fetched tracked documents after author exclusions"
+    );
     // Только текущее состояние MSSQL определяет очередь, старый аудит её не скрывает.
     let pending_requests = requests
         .iter()
@@ -2374,6 +2401,12 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
     let query = query_for_report_period(&source_query, period, date)?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
+    let requests = requests
+        .into_iter()
+        .filter(|request| {
+            !is_excluded_author(&request.requester, &requests_config.excluded_authors)
+        })
+        .collect::<Vec<_>>();
 
     let mut processed = 0usize;
     let mut waiting = 0usize;
@@ -2480,6 +2513,30 @@ fn query_for_report_period(query: &str, period: ReportPeriod, date: &str) -> Res
 
 // Фоновый опрос использует скользящее окно, чтобы даты в SQL-файле не
 // приходилось менять вручную. Граница периода вычисляется самим SQL Server.
+fn normalize_author_search(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn parse_author_exclusions(value: &str) -> Vec<String> {
+    let mut exclusions = Vec::new();
+    for entry in value.lines() {
+        let normalized = normalize_author_search(entry);
+        if !normalized.is_empty() && !exclusions.contains(&normalized) {
+            exclusions.push(normalized);
+        }
+    }
+    exclusions
+}
+
+fn is_excluded_author(requester: &str, exclusions: &[String]) -> bool {
+    let author = normalize_author_search(requester);
+    !author.is_empty() && exclusions.iter().any(|part| author.contains(part))
+}
+
 fn query_for_poll_lookback(query: &str, lookback_days: u32) -> Result<String> {
     let days = lookback_days.max(1);
     let start = format!(
