@@ -50,5 +50,6 @@ where d.date1 >= @d1
       N'Запросы на права',
       N'Согласие на работу в выходные дни'
   )
+-- {{BRANCH_FILTER}}
 -- {{AUTHOR_EXCLUSION_FILTER}}
 order by d.date1, d.id_filial, d.id;

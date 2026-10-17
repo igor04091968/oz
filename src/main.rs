@@ -116,6 +116,8 @@ struct RequestsConfig {
     poll_lookback_days: u32,
     #[serde(default)]
     excluded_authors: Vec<String>,
+    #[serde(default)]
+    branch_id: Option<i32>,
 }
 
 fn default_poll_lookback_days() -> u32 {
@@ -336,6 +338,7 @@ struct GuiSettings {
     poll_interval_seconds: String,
     poll_lookback_days: String,
     excluded_authors: String,
+    branch_id: String,
     poll_enabled: bool,
     sql_server: String,
     sql_port: String,
@@ -378,6 +381,7 @@ impl Default for GuiSettings {
             poll_interval_seconds: "60".to_owned(),
             poll_lookback_days: "30".to_owned(),
             excluded_authors: String::new(),
+            branch_id: String::new(),
             poll_enabled: true,
             sql_server: "srv-db".to_owned(),
             sql_port: "1433".to_owned(),
@@ -600,6 +604,7 @@ impl GuiApp {
     }
 
     fn save_settings(&mut self) -> Result<()> {
+        parse_branch_id(&self.settings.branch_id)?;
         save_gui_settings(&self.settings)?;
         write_runtime_config(&self.settings)?;
         if self.remember_secrets {
@@ -1716,6 +1721,8 @@ impl eframe::App for GuiApp {
                             .hint_text("Например: Иванов\nПетрова Ольга"),
                     );
                     ui.small("Исключённые заявки не попадают в оповещения, отчёты и автодозвон.");
+                    text_field(ui, "ID филиала", &mut self.settings.branch_id);
+                    ui.small("Целое число от 0. Пусто — все филиалы. Фильтр применяется к опросу, отчётам и оповещениям после сохранения настроек.");
                     ui.separator();
                     ui.label(eframe::egui::RichText::new("Файлы и аудит").strong());
                     text_field(ui, "Конфигурация", &mut self.settings.config_path);
@@ -2170,6 +2177,9 @@ fn build_connection_string(settings: &GuiSettings, password: &str) -> String {
 // Генерируем минимальный runtime config для дочернего process-requests.
 // Пароль MSSQL передается ему только через environment.
 fn write_runtime_config(settings: &GuiSettings) -> Result<()> {
+    let branch_config = parse_branch_id(&settings.branch_id)?
+        .map(|id| format!("branch_id = {id}\n"))
+        .unwrap_or_default();
     let interval_seconds = settings
         .poll_interval_seconds
         .parse::<u64>()
@@ -2190,6 +2200,7 @@ query_file = {:?}
 mark_unapproved_as_seen = false
 poll_lookback_days = {}
 excluded_authors = {:?}
+{}
 
 [pfsense]
 base_url = {:?}
@@ -2212,6 +2223,7 @@ skip_tls_verify = {}
             .unwrap_or(default_poll_lookback_days())
             .max(1),
         parse_author_exclusions(&settings.excluded_authors),
+        branch_config,
         settings.pfsense_url,
         settings
             .pfsense_timeout_seconds
@@ -2314,6 +2326,7 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     let source_query = fs::read_to_string(&requests_config.query_file)
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
     let query = query_for_poll_lookback(&source_query, requests_config.poll_lookback_days)?;
+    let query = apply_branch_filter_to_query(&query, requests_config.branch_id)?;
     let query = apply_author_exclusions_to_query(&query, &requests_config.excluded_authors)?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
     let excluded = requests
@@ -2401,6 +2414,7 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
     let source_query = fs::read_to_string(&requests_config.query_file)
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
     let query = query_for_report_period(&source_query, period, date)?;
+    let query = apply_branch_filter_to_query(&query, requests_config.branch_id)?;
     let query = apply_author_exclusions_to_query(&query, &requests_config.excluded_authors)?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
     let requests = requests
@@ -2542,6 +2556,40 @@ fn is_excluded_author(requester: &str, exclusions: &[String]) -> bool {
             .map(|part| normalize_author_search(part))
             .filter(|part| !part.is_empty())
             .any(|part| author.contains(&part))
+}
+
+fn parse_branch_id(value: &str) -> Result<Option<i32>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let id = value
+        .parse::<i32>()
+        .context("ID филиала должен быть целым числом от 0 до 2147483647")?;
+    if id < 0 {
+        bail!("ID филиала должен быть неотрицательным");
+    }
+    Ok(Some(id))
+}
+
+fn apply_branch_filter_to_query(query: &str, branch_id: Option<i32>) -> Result<String> {
+    const MARKER: &str = "-- {{BRANCH_FILTER}}";
+    if branch_id.is_some_and(|id| id < 0) {
+        bail!("ID филиала должен быть неотрицательным");
+    }
+    let occurrences = query.matches(MARKER).count();
+    if occurrences == 0 && branch_id.is_none() {
+        return Ok(query.to_owned());
+    }
+    if occurrences != 1 {
+        bail!(
+            "SQL-запрос должен содержать один маркер {MARKER} в WHERE для фильтра филиала. Обновите SQL-файл."
+        );
+    }
+    let predicate = branch_id
+        .map(|id| format!("and d.id_filial = {id}"))
+        .unwrap_or_default();
+    Ok(query.replace(MARKER, &predicate))
 }
 
 fn apply_author_exclusions_to_query(query: &str, exclusions: &[String]) -> Result<String> {
@@ -3381,6 +3429,64 @@ mod tests {
     }
 
     #[test]
+    fn branch_id_accepts_only_nonnegative_integers_or_all_branches() {
+        assert_eq!(parse_branch_id("  ").unwrap(), None);
+        assert_eq!(parse_branch_id("0").unwrap(), Some(0));
+        assert_eq!(parse_branch_id(" 42 ").unwrap(), Some(42));
+        assert_eq!(parse_branch_id("2147483647").unwrap(), Some(i32::MAX));
+        for value in ["-1", "2147483648", "Москва", "1.5", "1 or 1=1"] {
+            assert!(parse_branch_id(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn branch_filter_applies_to_poll_and_report_without_changing_other_filters() {
+        let source = include_str!("../sql/remote_work_requests.sql");
+        for dated in [
+            query_for_poll_lookback(source, 30).unwrap(),
+            query_for_report_period(source, ReportPeriod::Day, "2026-10-16").unwrap(),
+            query_for_report_period(source, ReportPeriod::Week, "2026-10-16").unwrap(),
+        ] {
+            let query = apply_branch_filter_to_query(&dated, Some(7)).unwrap();
+            let query = apply_author_exclusions_to_query(&query, &["Иванов".to_owned()]).unwrap();
+            assert!(query.contains("and d.id_filial = 7"));
+            assert!(query.contains("charindex(N'иванов', isnull(u.name, N'')) > 0"));
+            assert!(query.contains("where por.id_filial = d.id_filial"));
+            assert!(query.contains("N'Согласие на работу в выходные дни'"));
+            assert!(!query.contains("{{BRANCH_FILTER}}"));
+            assert!(!query.contains("{{AUTHOR_EXCLUSION_FILTER}}"));
+        }
+        let query = apply_branch_filter_to_query(source, None).unwrap();
+        assert!(!query.contains("and d.id_filial ="));
+        assert!(!query.contains("{{BRANCH_FILTER}}"));
+    }
+
+    #[test]
+    fn selected_branch_never_silently_runs_legacy_or_ambiguous_sql() {
+        let legacy = "select * from docum d where d.del = 0;";
+        assert!(apply_branch_filter_to_query(legacy, Some(1)).is_err());
+        assert_eq!(apply_branch_filter_to_query(legacy, None).unwrap(), legacy);
+        let duplicate = "-- {{BRANCH_FILTER}}\n-- {{BRANCH_FILTER}}";
+        assert!(apply_branch_filter_to_query(duplicate, Some(1)).is_err());
+        assert!(apply_branch_filter_to_query(duplicate, None).is_err());
+        assert!(apply_branch_filter_to_query("-- {{BRANCH_FILTER}}", Some(-1)).is_err());
+    }
+
+    #[test]
+    fn existing_configs_keep_all_branches_and_numeric_selection_round_trips() {
+        let config: AppConfig = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        assert_eq!(config.requests.unwrap().branch_id, None);
+        let mut settings: GuiSettings = toml::from_str("poll_enabled = false").unwrap();
+        assert_eq!(settings.branch_id, "");
+        settings.branch_id = "7".to_owned();
+        let saved = toml::to_string(&settings).unwrap();
+        assert_eq!(
+            toml::from_str::<GuiSettings>(&saved).unwrap().branch_id,
+            "7"
+        );
+    }
+
+    #[test]
     fn poll_query_uses_dynamic_lookback_window() {
         let query = "set @d1 = '20260801';\nset @d2 = '20260825';\nselect 1;";
         let actual = query_for_poll_lookback(query, 30).unwrap();
@@ -3458,6 +3564,7 @@ mod tests {
         let mut settings = GuiSettings::default();
         let path = std::env::temp_dir().join(format!("oz-test-{}.toml", std::process::id()));
         settings.config_path = path.to_string_lossy().into_owned();
+        settings.branch_id = "7".to_owned();
         write_runtime_config(&settings).unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         let config: AppConfig = toml::from_str(&raw).unwrap();
@@ -3467,6 +3574,7 @@ mod tests {
             "MSSQL_CONNECTION_STRING"
         );
         assert!(!raw.contains("password"));
+        assert_eq!(config.requests.unwrap().branch_id, Some(7));
     }
 
     #[test]
