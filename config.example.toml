@@ -10,6 +10,9 @@ default_connection_string = "server=tcp:srv-db,1433;database=rd_all;TrustServerC
 query_file = "sql/remote_work_requests.sql"
 mark_unapproved_as_seen = false
 poll_lookback_days = 30
+# Name fragments, OR within the list; empty means any recipient.
+included_recipients = []
+excluded_authors = []
 # Uncomment to limit all four flows to one docum.id_filial; omit for all branches.
 # branch_id = 1
 

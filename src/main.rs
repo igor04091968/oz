@@ -117,6 +117,8 @@ struct RequestsConfig {
     #[serde(default)]
     excluded_authors: Vec<String>,
     #[serde(default)]
+    included_recipients: Vec<String>,
+    #[serde(default)]
     branch_id: Option<i32>,
 }
 
@@ -338,6 +340,7 @@ struct GuiSettings {
     poll_interval_seconds: String,
     poll_lookback_days: String,
     excluded_authors: String,
+    included_recipients: String,
     branch_id: String,
     poll_enabled: bool,
     sql_server: String,
@@ -381,6 +384,7 @@ impl Default for GuiSettings {
             poll_interval_seconds: "60".to_owned(),
             poll_lookback_days: "30".to_owned(),
             excluded_authors: String::new(),
+            included_recipients: String::new(),
             branch_id: String::new(),
             poll_enabled: true,
             sql_server: "srv-db".to_owned(),
@@ -1699,7 +1703,7 @@ impl eframe::App for GuiApp {
                         ui.close_menu();
                     }
                 });
-                ui.menu_button("Заявки", |ui| {
+                ui.menu_button("Фоновый опрос", |ui| {
                     ui.set_min_width(440.0);
                     ui.label(eframe::egui::RichText::new("Фоновый опрос").strong());
                     ui.checkbox(&mut self.settings.poll_enabled, "Включить фоновый опрос");
@@ -1713,6 +1717,14 @@ impl eframe::App for GuiApp {
                         "Глубина выборки, дней",
                         &mut self.settings.poll_lookback_days,
                     );
+                    ui.label("Только заявки, направленные сотрудникам");
+                    ui.add(
+                        eframe::egui::TextEdit::multiline(&mut self.settings.included_recipients)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3)
+                            .hint_text("Фамилия или часть ФИО, по одному на строку"),
+                    );
+                    ui.small("Хотя бы один получатель должен совпасть со списком. Пусто — все получатели.");
                     ui.label("Исключать авторов (часть имени или фамилии, по одному на строку)");
                     ui.add(
                         eframe::egui::TextEdit::multiline(&mut self.settings.excluded_authors)
@@ -1724,6 +1736,10 @@ impl eframe::App for GuiApp {
                     text_field(ui, "ID филиала", &mut self.settings.branch_id);
                     ui.small("Целое число от 0. Пусто — все филиалы. Фильтр применяется к опросу, отчётам и оповещениям после сохранения настроек.");
                     ui.separator();
+                    ui.small("Получатели, исключения авторов и филиал применяются вместе к опросу, отчётам и оповещениям. После сохранения перезапустите опрос.");
+                });
+                ui.menu_button("Заявки", |ui| {
+                    ui.set_min_width(440.0);
                     ui.label(eframe::egui::RichText::new("Файлы и аудит").strong());
                     text_field(ui, "Конфигурация", &mut self.settings.config_path);
                     text_field(ui, "SQL-запрос", &mut self.settings.query_file);
@@ -2200,6 +2216,7 @@ query_file = {:?}
 mark_unapproved_as_seen = false
 poll_lookback_days = {}
 excluded_authors = {:?}
+included_recipients = {:?}
 {}
 
 [pfsense]
@@ -2223,6 +2240,7 @@ skip_tls_verify = {}
             .unwrap_or(default_poll_lookback_days())
             .max(1),
         parse_author_exclusions(&settings.excluded_authors),
+        parse_author_exclusions(&settings.included_recipients),
         branch_config,
         settings.pfsense_url,
         settings
@@ -2328,6 +2346,7 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     let query = query_for_poll_lookback(&source_query, requests_config.poll_lookback_days)?;
     let query = apply_branch_filter_to_query(&query, requests_config.branch_id)?;
     let query = apply_author_exclusions_to_query(&query, &requests_config.excluded_authors)?;
+    let query = apply_recipient_filter_to_query(&query, &requests_config.included_recipients)?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
     let excluded = requests
         .iter()
@@ -2416,6 +2435,7 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
     let query = query_for_report_period(&source_query, period, date)?;
     let query = apply_branch_filter_to_query(&query, requests_config.branch_id)?;
     let query = apply_author_exclusions_to_query(&query, &requests_config.excluded_authors)?;
+    let query = apply_recipient_filter_to_query(&query, &requests_config.included_recipients)?;
     let requests = fetch_remote_work_requests(&config.mssql, &query).await?;
     let requests = requests
         .into_iter()
@@ -2570,6 +2590,42 @@ fn parse_branch_id(value: &str) -> Result<Option<i32>> {
         bail!("ID филиала должен быть неотрицательным");
     }
     Ok(Some(id))
+}
+
+// A recipient allowlist selects documents through active assignments, not their authors.
+// EXISTS avoids duplicates and leaves whole-document status counters unchanged.
+fn apply_recipient_filter_to_query(query: &str, recipients: &[String]) -> Result<String> {
+    const MARKER: &str = "-- {{RECIPIENT_INCLUSION_FILTER}}";
+    let fragments = recipients
+        .iter()
+        .map(|name| normalize_author_search(name))
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    let occurrences = query.matches(MARKER).count();
+    if occurrences == 0 && fragments.is_empty() {
+        return Ok(query.to_owned());
+    }
+    if occurrences != 1 {
+        bail!(
+            "SQL-запрос должен содержать один маркер {MARKER} в WHERE для фильтра получателей. Обновите SQL-файл."
+        );
+    }
+    let predicate = if fragments.is_empty() {
+        String::new()
+    } else {
+        let conditions = fragments
+            .iter()
+            .map(|name| {
+                let escaped = name.replace('\'', "''");
+                format!("charindex(N'{escaped}', lower(isnull(recipient.name, N''))) > 0")
+            })
+            .collect::<Vec<_>>()
+            .join(" or ");
+        format!(
+            "and exists (\n    select 1\n    from poruch recipient_assignment\n    inner join users recipient on recipient.id = recipient_assignment.id_komu\n      and recipient.id_filial = recipient_assignment.fil_komu\n    where recipient_assignment.id_filial = d.id_filial\n      and recipient_assignment.id_docum = d.id\n      and recipient_assignment.del = 0\n      and ({conditions})\n)"
+        )
+    };
+    Ok(query.replace(MARKER, &predicate))
 }
 
 fn apply_branch_filter_to_query(query: &str, branch_id: Option<i32>) -> Result<String> {
@@ -3560,11 +3616,99 @@ mod tests {
     }
 
     #[test]
+    fn recipient_filter_never_silently_runs_legacy_or_ambiguous_sql() {
+        let recipients = vec!["Петров".to_owned()];
+        assert!(apply_recipient_filter_to_query("select 1", &recipients).is_err());
+        assert_eq!(
+            apply_recipient_filter_to_query("select 1", &[]).unwrap(),
+            "select 1"
+        );
+        assert_eq!(
+            apply_recipient_filter_to_query("select 1", &["  ".to_owned()]).unwrap(),
+            "select 1"
+        );
+        let duplicate = "-- {{RECIPIENT_INCLUSION_FILTER}}\n-- {{RECIPIENT_INCLUSION_FILTER}}";
+        assert!(apply_recipient_filter_to_query(duplicate, &recipients).is_err());
+        assert!(apply_recipient_filter_to_query(duplicate, &[]).is_err());
+    }
+
+    #[test]
+    fn recipient_filter_uses_active_assignments_any_name_and_escaped_literals() {
+        let query = apply_recipient_filter_to_query(
+            "select 1 from docum d where 1=1\n-- {{RECIPIENT_INCLUSION_FILTER}}",
+            &[" ПЕТРОВ ".to_owned(), "О'Нил_%".to_owned(), " ".to_owned()],
+        )
+        .unwrap();
+        assert!(query.contains("and exists ("));
+        assert!(query.contains("recipient.id = recipient_assignment.id_komu"));
+        assert!(query.contains("recipient.id_filial = recipient_assignment.fil_komu"));
+        assert!(query.contains("recipient_assignment.id_filial = d.id_filial"));
+        assert!(query.contains("recipient_assignment.id_docum = d.id"));
+        assert!(query.contains("recipient_assignment.del = 0"));
+        assert!(query.contains("charindex(N'петров', lower(isnull(recipient.name, N''))) > 0 or charindex(N'о''нил_%', lower(isnull(recipient.name, N''))) > 0"));
+        assert!(!query.contains("and not"));
+        assert!(!query.contains("u.name"));
+        assert!(!query.contains("{{RECIPIENT_INCLUSION_FILTER}}"));
+    }
+
+    #[test]
+    fn recipient_filter_combines_with_author_branch_and_all_report_periods() {
+        let source = include_str!("../sql/remote_work_requests.sql");
+        for dated in [
+            query_for_poll_lookback(source, 30).unwrap(),
+            query_for_report_period(source, ReportPeriod::Day, "2026-10-20").unwrap(),
+            query_for_report_period(source, ReportPeriod::Week, "2026-10-20").unwrap(),
+        ] {
+            let query = apply_branch_filter_to_query(&dated, Some(7)).unwrap();
+            let query = apply_author_exclusions_to_query(&query, &["Автор".to_owned()]).unwrap();
+            let query = apply_recipient_filter_to_query(&query, &["Петров".to_owned()]).unwrap();
+            assert!(query.contains("and d.id_filial = 7"));
+            assert!(query.contains("and not (charindex(N'автор', isnull(u.name, N'')) > 0)"));
+            assert!(query.contains("and recipient.id_filial = recipient_assignment.fil_komu"));
+            assert!(query.contains("charindex(N'петров', lower(isnull(recipient.name, N''))) > 0"));
+            assert!(query.contains("where por.id_filial = d.id_filial"));
+            assert!(query.contains("and por.del = 0"));
+            assert!(!query.contains("{{"));
+        }
+        let empty = apply_recipient_filter_to_query(source, &[]).unwrap();
+        assert!(!empty.contains("from poruch recipient_assignment"));
+        assert!(!empty.contains("{{RECIPIENT_INCLUSION_FILTER}}"));
+    }
+
+    #[test]
+    fn recipient_filter_semantics_sql_fixture() {
+        let source = "select d.id, d.id_filial from docum d where 1=1\n-- {{RECIPIENT_INCLUSION_FILTER}}\norder by d.id_filial, d.id";
+        let actual =
+            apply_recipient_filter_to_query(source, &["Петров".to_owned(), "Сидорова".to_owned()])
+                .unwrap();
+        assert!(actual.contains("and exists ("));
+        if std::env::var_os("OZ_RECIPIENT_SQL_FIXTURE").is_some() {
+            println!("OZ_TEST_QUERY_BEGIN\n{actual}\nOZ_TEST_QUERY_END");
+        }
+    }
+
+    #[test]
+    fn recipient_filter_settings_default_empty_and_round_trip_separately_from_authors() {
+        let legacy: GuiSettings = toml::from_str("excluded_authors = \"Иванов\"").unwrap();
+        assert!(legacy.included_recipients.is_empty());
+        assert_eq!(legacy.excluded_authors, "Иванов");
+        let mut settings = legacy;
+        settings.included_recipients = "Петров\nСидорова".to_owned();
+        let restored: GuiSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.included_recipients, "Петров\nСидорова");
+        assert_eq!(restored.excluded_authors, "Иванов");
+        let config: AppConfig = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        assert!(config.requests.unwrap().included_recipients.is_empty());
+    }
+
+    #[test]
     fn gui_runtime_config_is_valid_toml_without_secrets() {
         let mut settings = GuiSettings::default();
         let path = std::env::temp_dir().join(format!("oz-test-{}.toml", std::process::id()));
         settings.config_path = path.to_string_lossy().into_owned();
         settings.branch_id = "7".to_owned();
+        settings.included_recipients = " ПЕТРОВ  Иван \n\nСидорова\nпетров Иван".to_owned();
+        settings.excluded_authors = "Иванов".to_owned();
         write_runtime_config(&settings).unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         let config: AppConfig = toml::from_str(&raw).unwrap();
@@ -3574,7 +3718,13 @@ mod tests {
             "MSSQL_CONNECTION_STRING"
         );
         assert!(!raw.contains("password"));
-        assert_eq!(config.requests.unwrap().branch_id, Some(7));
+        let requests = config.requests.unwrap();
+        assert_eq!(requests.branch_id, Some(7));
+        assert_eq!(
+            requests.included_recipients,
+            vec!["петров иван", "сидорова"]
+        );
+        assert_eq!(requests.excluded_authors, vec!["иванов"]);
     }
 
     #[test]

@@ -52,4 +52,5 @@ where d.date1 >= @d1
   )
 -- {{BRANCH_FILTER}}
 -- {{AUTHOR_EXCLUSION_FILTER}}
+-- {{RECIPIENT_INCLUSION_FILTER}}
 order by d.date1, d.id_filial, d.id;
