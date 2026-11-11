@@ -45,18 +45,18 @@ outer apply (
 ) statuses
 outer apply (
     select
-        coalesce(string_agg(
-            concat(rtrim(isnull(recipient.name, N'')), N'=', ltrim(rtrim(isnull(por.ispol, N'')))),
-            N';'
-        ) within group (order by por.num, por.id),
-        N'') as assignment_actors
-    from poruch por
-    left join users recipient
-      on recipient.id = por.id_komu
-     and recipient.id_filial = por.fil_komu
-    where por.id_filial = d.id_filial
-      and por.id_docum = d.id
-      and por.del = 0
+        coalesce(stuff((
+            select N';' + rtrim(isnull(recipient.name, N'')) + N'=' + ltrim(rtrim(isnull(por.ispol, N'')))
+            from poruch por
+            left join users recipient
+              on recipient.id = por.id_komu
+             and recipient.id_filial = por.fil_komu
+            where por.id_filial = d.id_filial
+              and por.id_docum = d.id
+              and por.del = 0
+            order by por.num, por.id
+            for xml path(''), type
+        ).value('.', 'nvarchar(max)'), 1, 1, N''), N'') as assignment_actors
 ) actors
 where d.date1 >= @d1
   and d.date1 < dateadd(day, 1, @d2)
