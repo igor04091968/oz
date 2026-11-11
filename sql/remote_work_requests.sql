@@ -23,7 +23,8 @@ select
     statuses.status_rejected,
     statuses.status_noted,
     statuses.status_read,
-    statuses.status_unknown
+    statuses.status_unknown,
+    actors.assignment_actors
 from docum d
 inner join potok p on p.id = d.id_potok
 inner join users u on u.id = d.id_contr
@@ -42,6 +43,21 @@ outer apply (
       and por.id_docum = d.id
       and por.del = 0
 ) statuses
+outer apply (
+    select
+        coalesce(string_agg(
+            concat(rtrim(isnull(recipient.name, N'')), N'=', ltrim(rtrim(isnull(por.ispol, N'')))),
+            N';'
+        ) within group (order by por.num, por.id),
+        N'') as assignment_actors
+    from poruch por
+    left join users recipient
+      on recipient.id = por.id_komu
+     and recipient.id_filial = por.fil_komu
+    where por.id_filial = d.id_filial
+      and por.id_docum = d.id
+      and por.del = 0
+) actors
 where d.date1 >= @d1
   and d.date1 < dateadd(day, 1, @d2)
   -- {{FLOW_FILTER}}

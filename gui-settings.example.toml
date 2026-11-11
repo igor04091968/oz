@@ -4,6 +4,7 @@ poll_interval_seconds = "60"
 poll_lookback_days = "30"
 included_recipients = ""
 excluded_authors = ""
+preapproval_employees = ""
 branch_id = ""
 tracked_flows = "Заявки на удаленную работу\nСлужебные записки\nЗапросы на права\nСогласие на работу в выходные дни"
 poll_enabled = true

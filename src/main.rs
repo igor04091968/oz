@@ -119,6 +119,8 @@ struct RequestsConfig {
     #[serde(default)]
     included_recipients: Vec<String>,
     #[serde(default)]
+    preapproval_employees: Vec<String>,
+    #[serde(default)]
     branch_id: Option<i32>,
     #[serde(default = "default_tracked_flows")]
     tracked_flows: Vec<String>,
@@ -140,6 +142,7 @@ struct RemoteWorkRequest {
     requester: String,
     por_neisp: i32,
     assignment_counts: Option<[i32; 8]>,
+    assignment_actors: Option<Vec<(String, String)>>,
 }
 
 const REMOTE_WORK_FLOW: &str = "Заявки на удаленную работу";
@@ -364,6 +367,7 @@ struct GuiSettings {
     poll_lookback_days: String,
     excluded_authors: String,
     included_recipients: String,
+    preapproval_employees: String,
     branch_id: String,
     tracked_flows: String,
     poll_enabled: bool,
@@ -409,6 +413,7 @@ impl Default for GuiSettings {
             poll_lookback_days: "30".to_owned(),
             excluded_authors: String::new(),
             included_recipients: String::new(),
+            preapproval_employees: String::new(),
             branch_id: String::new(),
             tracked_flows: TRACKED_FLOW_NAMES.join("
 "),
@@ -461,6 +466,9 @@ struct GuiApp {
     remember_secrets: bool,
     status: String,
     running: bool,
+    tray_blink_active: bool,
+    tray_blink_phase: bool,
+    tray_blink_next: Instant,
     stop: Arc<AtomicBool>,
     sip_stop: Arc<AtomicBool>,
     sip_running: bool,
@@ -496,6 +504,9 @@ impl GuiApp {
             remember_secrets: true,
             status: "Готово. Ожидание проверки заявок.".to_owned(),
             running: false,
+            tray_blink_active: false,
+            tray_blink_phase: false,
+            tray_blink_next: Instant::now(),
             stop: Arc::new(AtomicBool::new(false)),
             sip_stop: Arc::new(AtomicBool::new(false)),
             sip_running: false,
@@ -1571,7 +1582,24 @@ impl eframe::App for GuiApp {
             ctx.send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
             self.desktop_action(desktop::Action::Hide, ctx);
         }
-        if let Ok(message) = self.result_rx.try_recv() {
+        while let Ok(mut message) = self.result_rx.try_recv() {
+            if let Some(rest) = message.strip_prefix("OZ_TRAY_BLINK ") {
+                if let Some((count, tail)) = rest.split_once('\n') {
+                    let gated = count.trim().parse::<usize>().unwrap_or(0);
+                    self.tray_blink_active = gated > 0;
+                    if let Some(tray) = self.desktop.as_mut() {
+                        tray.set_blinking(gated > 0);
+                        if gated == 0 {
+                            tray.tick_blink(false);
+                        }
+                    }
+                    if gated == 0 {
+                        self.tray_blink_phase = false;
+                        self.tray_blink_next = Instant::now();
+                    }
+                    message = tail.to_owned();
+                }
+            }
             if message.starts_with("OZ_FOCUS\nВиртуальный SIP-телефон") {
                 self.sip_ready = true;
             } else if message.starts_with("SIP-регистрация не выполнена:") {
@@ -1584,8 +1612,18 @@ impl eframe::App for GuiApp {
             if let Some(message) = message.strip_prefix("OZ_FOCUS\n") {
                 self.desktop_action(desktop::Action::Show, ctx);
                 self.status = message.to_owned();
-            } else {
+            } else if !message.is_empty() {
                 self.status = message;
+            }
+        }
+        if self.tray_blink_active {
+            let now = Instant::now();
+            if now >= self.tray_blink_next {
+                self.tray_blink_phase = !self.tray_blink_phase;
+                if let Some(tray) = self.desktop.as_mut() {
+                    tray.tick_blink(self.tray_blink_phase);
+                }
+                self.tray_blink_next = now + Duration::from_millis(700);
             }
         }
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -1818,6 +1856,14 @@ impl eframe::App for GuiApp {
                             .hint_text("Например: Иванов\nПетрова Ольга"),
                     );
                     ui.small("Исключённые заявки не попадают в оповещения, отчёты и автодозвон.");
+                    ui.label("Предварительно согласуют (до меня, по одному на строку)");
+                    ui.add(
+                        eframe::egui::TextEdit::multiline(&mut self.settings.preapproval_employees)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3)
+                            .hint_text("Фамилия или часть ФИО, например: Петров\nСидорова"),
+                    );
+                    ui.small("Пока заявка (любой поток) не согласована всеми указанными сотрудниками, OZ только мигает в трее без XMPP/звонка. После согласования мигание прекращается и приходит обычное уведомление о неисполненных заявках. Пусто — работать как раньше.");
                     text_field(ui, "ID филиала", &mut self.settings.branch_id);
                     ui.small("Целое число от 0. Пусто — все филиалы. Фильтр применяется к опросу, отчётам и оповещениям после сохранения настроек.");
                     ui.separator();
@@ -2310,6 +2356,7 @@ mark_unapproved_as_seen = false
 poll_lookback_days = {}
 excluded_authors = {:?}
 included_recipients = {:?}
+preapproval_employees = {:?}
 tracked_flows = {:?}
 {}
 
@@ -2335,6 +2382,7 @@ skip_tls_verify = {}
             .max(1),
         parse_author_exclusions(&settings.excluded_authors),
         parse_author_exclusions(&settings.included_recipients),
+        parse_author_exclusions(&settings.preapproval_employees),
         parse_tracked_flows(&settings.tracked_flows),
         branch_config,
         settings.pfsense_url,
@@ -2466,12 +2514,10 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
         excluded, "fetched tracked documents after author exclusions"
     );
     // Только текущее состояние MSSQL определяет очередь, старый аудит её не скрывает.
-    let pending_requests = requests
-        .iter()
-        .filter(|request| !matches!(request.source_status(), "processed" | "rejected"))
-        .collect::<Vec<_>>();
+    let (notify_requests, gated_requests) =
+        split_pending_requests(&requests, &requests_config.preapproval_employees);
     // Отпечаток набора используется GUI для подавления повторных уведомлений.
-    let mut pending_keys = pending_requests
+    let mut pending_keys = notify_requests
         .iter()
         .map(|request| {
             format!(
@@ -2485,22 +2531,29 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     pending_keys.sort();
     let pending_fingerprint = pending_keys.join("\n");
     println!(
-        "OZ_RESULT fetched={} pending={} fingerprint={}",
+        "OZ_RESULT fetched={} pending={} gated={} fingerprint={}",
         requests.len(),
-        pending_requests.len(),
+        notify_requests.len(),
+        gated_requests.len(),
         hash_pending_requests(&pending_fingerprint)
     );
     println!(
         "OZ_PENDING_NUMS {}",
-        pending_requests
+        notify_requests
             .iter()
             .map(|request| request.display_number())
             .collect::<Vec<_>>()
             .join(",")
     );
-    for request in &pending_requests {
+    for request in &notify_requests {
         println!(
             "OZ_PENDING_REQUEST num={} flow={} requester={}",
+            request.request_num, request.flow_name, request.requester
+        );
+    }
+    for request in &gated_requests {
+        println!(
+            "OZ_GATED_REQUEST num={} flow={} requester={}",
             request.request_num, request.flow_name, request.requester
         );
     }
@@ -2749,6 +2802,63 @@ fn apply_flow_filter_to_query(query: &str, flows: &[String]) -> Result<String> {
         .collect::<Vec<_>>()
         .join(", ");
     Ok(query.replace(MARKER, &format!("and rtrim(p.name) in ({values})")))
+}
+
+fn parse_assignment_actors(raw: &str) -> Vec<(String, String)> {
+    raw.split(';')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (name, status) = entry.rsplit_once('=').unwrap_or((entry, ""));
+            let name = name.trim().to_owned();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name, status.trim().to_owned()))
+        })
+        .collect()
+}
+
+fn request_preapproved_by_employees(request: &RemoteWorkRequest, preapprovers: &[String]) -> bool {
+    if preapprovers.is_empty() {
+        return true;
+    }
+    let Some(actors) = &request.assignment_actors else {
+        return false;
+    };
+    preapprovers.iter().all(|required| {
+        let required = normalize_author_search(required);
+        !required.is_empty()
+            && actors.iter().any(|(name, status)| {
+                status.trim() == "Согласовано"
+                    && normalize_author_search(name).contains(&required)
+            })
+    })
+}
+
+fn split_pending_requests<'a>(
+    requests: &'a [RemoteWorkRequest],
+    preapprovers: &[String],
+) -> (Vec<&'a RemoteWorkRequest>, Vec<&'a RemoteWorkRequest>) {
+    let base = requests
+        .iter()
+        .filter(|request| !matches!(request.source_status(), "processed" | "rejected"))
+        .collect::<Vec<_>>();
+    if preapprovers.is_empty() {
+        return (base, Vec::new());
+    }
+    let mut notify = Vec::new();
+    let mut gated = Vec::new();
+    for request in base {
+        if request_preapproved_by_employees(request, preapprovers) {
+            notify.push(request);
+        } else {
+            gated.push(request);
+        }
+    }
+    (notify, gated)
 }
 
 fn parse_branch_id(value: &str) -> Result<Option<i32>> {
@@ -3212,6 +3322,8 @@ fn remote_work_request_from_row(row: tiberius::Row) -> Result<RemoteWorkRequest>
         }
         Some(counts)
     };
+    let assignment_actors = get_optional_str(&row, "assignment_actors")
+        .map(|value| parse_assignment_actors(&value));
     Ok(RemoteWorkRequest {
         document_id: get_optional_str(&row, "document_id").filter(|id| !id.is_empty()),
         flow_name: get_optional_str(&row, "flow_name")
@@ -3225,6 +3337,7 @@ fn remote_work_request_from_row(row: tiberius::Row) -> Result<RemoteWorkRequest>
             .flatten()
             .unwrap_or(1),
         assignment_counts,
+        assignment_actors,
     })
 }
 
@@ -3394,6 +3507,7 @@ mod tests {
             requester: "Иванов Иван Иванович".to_owned(),
             por_neisp: 1,
             assignment_counts: None,
+            assignment_actors: None,
         }
     }
 
@@ -3851,7 +3965,7 @@ mod tests {
         let with_flows = apply_flow_filter_to_query(source, &default_tracked_flows()).unwrap();
         let empty = apply_recipient_filter_to_query(&with_flows, &[]).unwrap();
         assert!(!empty.contains("from poruch recipient_assignment"));
-        assert!(!empty.contains("{{"));
+        assert!(!empty.contains("{{RECIPIENT_INCLUSION_FILTER}}"));
     }
 
     #[test]

@@ -13,6 +13,8 @@ poll_lookback_days = 30
 # Name fragments, OR within the list; empty means any recipient.
 included_recipients = []
 excluded_authors = []
+# Employees (name fragments) who must approve first; empty = notify immediately.
+preapproval_employees = []
 # One flow name per item (potok.name). Add custom flows if needed.
 tracked_flows = [
   "Заявки на удаленную работу",

@@ -101,8 +101,29 @@ mod platform {
     const VALUE_NAME: &str = "OZ";
 
     pub struct Desktop {
-        _tray: TrayIcon,
+        tray: TrayIcon,
         events: Receiver<Action>,
+        normal_icon: Icon,
+        blink_icon: Icon,
+        blinking: bool,
+    }
+
+    fn tray_icon_rgba(bright: bool) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(32 * 32 * 4);
+        let bg = if bright { [255, 196, 0, 255] } else { [0, 120, 212, 255] };
+        let fg = [255, 255, 255, 255];
+        for y in 0..32 {
+            for x in 0..32 {
+                let ring = (6..14).contains(&x)
+                    && (7..25).contains(&y)
+                    && (!(8..12).contains(&x) || !(10..22).contains(&y));
+                let three = (18..27).contains(&x)
+                    && (7..25).contains(&y)
+                    && (x >= 24 || (7..10).contains(&y) || (14..18).contains(&y) || y >= 22);
+                rgba.extend_from_slice(if ring || three { &fg } else { &bg });
+            }
+        }
+        rgba
     }
 
     fn native_show_window() {
@@ -134,25 +155,11 @@ mod platform {
             let exit = MenuItem::new("Выход", true, None);
             menu.append_items(&[&show, &hide, &exit])?;
             // A small opaque icon, generated locally; no external asset needed.
-            let mut rgba = Vec::with_capacity(32 * 32 * 4);
-            for y in 0..32 {
-                for x in 0..32 {
-                    let ring = (6..14).contains(&x)
-                        && (7..25).contains(&y)
-                        && (!(8..12).contains(&x) || !(10..22).contains(&y));
-                    let three = (18..27).contains(&x)
-                        && (7..25).contains(&y)
-                        && (x >= 24 || (7..10).contains(&y) || (14..18).contains(&y) || y >= 22);
-                    rgba.extend_from_slice(if ring || three {
-                        &[255, 255, 255, 255]
-                    } else {
-                        &[0, 120, 212, 255]
-                    });
-                }
-            }
+            let normal_icon = Icon::from_rgba(tray_icon_rgba(false), 32, 32)?;
+            let blink_icon = Icon::from_rgba(tray_icon_rgba(true), 32, 32)?;
             let tray = TrayIconBuilder::new()
                 .with_tooltip("ОЗ — отслеживание заявок")
-                .with_icon(Icon::from_rgba(rgba, 32, 32)?)
+                .with_icon(normal_icon.clone())
                 .with_menu(Box::new(menu))
                 .with_menu_on_left_click(false)
                 .build()
@@ -201,13 +208,39 @@ mod platform {
                 }
             }));
             Ok(Self {
-                _tray: tray,
+                tray,
                 events,
+                normal_icon,
+                blink_icon,
+                blinking: false,
             })
         }
 
         pub fn next_action(&self) -> Option<Action> {
             self.events.try_recv().ok()
+        }
+
+        pub fn set_blinking(&mut self, active: bool) {
+            if active && !self.blinking {
+                self.blinking = true;
+            } else if !active {
+                self.blinking = false;
+                let _ = self.tray.set_icon(Some(self.normal_icon.clone()));
+                let _ = self.tray.set_tooltip(Some("ОЗ — отслеживание заявок"));
+            }
+        }
+
+        pub fn tick_blink(&mut self, phase: bool) {
+            if !self.blinking {
+                return;
+            }
+            let icon = if phase {
+                self.blink_icon.clone()
+            } else {
+                self.normal_icon.clone()
+            };
+            let _ = self.tray.set_icon(Some(icon));
+            let _ = self.tray.set_tooltip(Some("ОЗ — ожидание согласования указанных сотрудников"));
         }
     }
 
@@ -257,6 +290,8 @@ mod platform {
         pub fn next_action(&self) -> Option<Action> {
             None
         }
+        pub fn set_blinking(&mut self, _active: bool) {}
+        pub fn tick_blink(&mut self, _phase: bool) {}
     }
     pub fn autostart_enabled() -> Result<bool> {
         Ok(false)
