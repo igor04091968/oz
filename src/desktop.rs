@@ -110,7 +110,11 @@ mod platform {
 
     fn tray_icon_rgba(bright: bool) -> Vec<u8> {
         let mut rgba = Vec::with_capacity(32 * 32 * 4);
-        let bg = if bright { [255, 196, 0, 255] } else { [0, 120, 212, 255] };
+        let bg = if bright {
+            [255, 196, 0, 255]
+        } else {
+            [0, 120, 212, 255]
+        };
         let fg = [255, 255, 255, 255];
         for y in 0..32 {
             for x in 0..32 {
@@ -240,7 +244,9 @@ mod platform {
                 self.normal_icon.clone()
             };
             let _ = self.tray.set_icon(Some(icon));
-            let _ = self.tray.set_tooltip(Some("ОЗ — ожидание согласования указанных сотрудников"));
+            let _ = self
+                .tray
+                .set_tooltip(Some("ОЗ — ожидание согласования указанных сотрудников"));
         }
     }
 

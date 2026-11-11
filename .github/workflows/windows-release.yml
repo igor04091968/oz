@@ -36,7 +36,7 @@ jobs:
           $version = "${{ inputs.tag }}".TrimStart('v')
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
-          & $iscc "/DMyAppVersion=$version" "/DSourceExe=target\release\oz.exe" "deploy\windows\oz.iss"
+          & $iscc "/DMyAppVersion=$version" "/DSourceExe=..\..\target\release\oz.exe" "deploy\windows\oz.iss"
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2

@@ -131,7 +131,10 @@ fn default_poll_lookback_days() -> u32 {
 }
 
 fn default_tracked_flows() -> Vec<String> {
-    TRACKED_FLOW_NAMES.iter().map(|name| (*name).to_owned()).collect()
+    TRACKED_FLOW_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -303,7 +306,10 @@ async fn run_main() -> Result<()> {
         }
         Some(Command::Gui(args)) => {
             set_working_directory(args.data_dir.as_deref())?;
-            run_gui(GuiArgs { data_dir: None, ..args })
+            run_gui(GuiArgs {
+                data_dir: None,
+                ..args
+            })
         }
     }
 }
@@ -415,8 +421,10 @@ impl Default for GuiSettings {
             included_recipients: String::new(),
             preapproval_employees: String::new(),
             branch_id: String::new(),
-            tracked_flows: TRACKED_FLOW_NAMES.join("
-"),
+            tracked_flows: TRACKED_FLOW_NAMES.join(
+                "
+",
+            ),
             poll_enabled: true,
             sql_server: "srv-db".to_owned(),
             sql_port: "1433".to_owned(),
@@ -750,14 +758,11 @@ impl GuiApp {
                                             break false;
                                         }
                                         if let Some(rx) = rtp_rx.as_ref() {
-                                            match rx.recv_timeout(Duration::from_millis(200)) {
-                                                Ok(_) => {
-                                                    received_packets += 1;
-                                                    if received_packets >= SIP_PICKUP_RTP_PACKETS_REQUIRED {
-                                                        break true;
-                                                    }
+                                            if rx.recv_timeout(Duration::from_millis(200)).is_ok() {
+                                                received_packets += 1;
+                                                if received_packets >= SIP_PICKUP_RTP_PACKETS_REQUIRED {
+                                                    break true;
                                                 }
-                                                Err(_) => {}
                                             }
                                         } else {
                                             thread::sleep(Duration::from_millis(200));
@@ -1583,22 +1588,22 @@ impl eframe::App for GuiApp {
             self.desktop_action(desktop::Action::Hide, ctx);
         }
         while let Ok(mut message) = self.result_rx.try_recv() {
-            if let Some(rest) = message.strip_prefix("OZ_TRAY_BLINK ") {
-                if let Some((count, tail)) = rest.split_once('\n') {
-                    let gated = count.trim().parse::<usize>().unwrap_or(0);
-                    self.tray_blink_active = gated > 0;
-                    if let Some(tray) = self.desktop.as_mut() {
-                        tray.set_blinking(gated > 0);
-                        if gated == 0 {
-                            tray.tick_blink(false);
-                        }
-                    }
+            if let Some(rest) = message.strip_prefix("OZ_TRAY_BLINK ")
+                && let Some((count, tail)) = rest.split_once('\n')
+            {
+                let gated = count.trim().parse::<usize>().unwrap_or(0);
+                self.tray_blink_active = gated > 0;
+                if let Some(tray) = self.desktop.as_mut() {
+                    tray.set_blinking(gated > 0);
                     if gated == 0 {
-                        self.tray_blink_phase = false;
-                        self.tray_blink_next = Instant::now();
+                        tray.tick_blink(false);
                     }
-                    message = tail.to_owned();
                 }
+                if gated == 0 {
+                    self.tray_blink_phase = false;
+                    self.tray_blink_next = Instant::now();
+                }
+                message = tail.to_owned();
             }
             if message.starts_with("OZ_FOCUS\nВиртуальный SIP-телефон") {
                 self.sip_ready = true;
@@ -2832,8 +2837,7 @@ fn request_preapproved_by_employees(request: &RemoteWorkRequest, preapprovers: &
         let required = normalize_author_search(required);
         !required.is_empty()
             && actors.iter().any(|(name, status)| {
-                status.trim() == "Согласовано"
-                    && normalize_author_search(name).contains(&required)
+                status.trim() == "Согласовано" && normalize_author_search(name).contains(&required)
             })
     })
 }
@@ -3322,8 +3326,8 @@ fn remote_work_request_from_row(row: tiberius::Row) -> Result<RemoteWorkRequest>
         }
         Some(counts)
     };
-    let assignment_actors = get_optional_str(&row, "assignment_actors")
-        .map(|value| parse_assignment_actors(&value));
+    let assignment_actors =
+        get_optional_str(&row, "assignment_actors").map(|value| parse_assignment_actors(&value));
     Ok(RemoteWorkRequest {
         document_id: get_optional_str(&row, "document_id").filter(|id| !id.is_empty()),
         flow_name: get_optional_str(&row, "flow_name")
