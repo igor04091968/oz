@@ -1909,7 +1909,7 @@ impl eframe::App for GuiApp {
                             .desired_rows(3)
                             .hint_text("Фамилия или часть ФИО, например: Петров\nСидорова"),
                     );
-                    ui.small("Пока заявка (любой поток) не согласована всеми указанными сотрудниками, OZ только мигает в трее без XMPP/звонка. После согласования мигание прекращается и приходит обычное уведомление о неисполненных заявках. Пусто — работать как раньше.");
+                    ui.small("Пока заявка (любой поток) не согласована хотя бы одним из указанных сотрудников (статус «Согласовано»), OZ только мигает в трее без XMPP/звонка. После согласования мигание прекращается и приходит обычное уведомление о неисполненных заявках. Пусто — работать как раньше.");
                     text_field(ui, "ID филиала", &mut self.settings.branch_id);
                     ui.small("Целое число от 0. Пусто — все филиалы. Фильтр применяется к опросу, отчётам и оповещениям после сохранения настроек.");
                     ui.separator();
@@ -3120,7 +3120,7 @@ fn request_preapproved_by_employees(request: &RemoteWorkRequest, preapprovers: &
     let Some(actors) = &request.assignment_actors else {
         return false;
     };
-    preapprovers.iter().all(|required| {
+    preapprovers.iter().any(|required| {
         let required = normalize_author_search(required);
         !required.is_empty()
             && actors.iter().any(|(name, status)| {
