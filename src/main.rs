@@ -84,6 +84,9 @@ struct ReportArgs {
     date: String,
     #[arg(long, value_enum, default_value_t = ReportPeriod::Day)]
     period: ReportPeriod,
+    /// Путь для сохранения отчёта в формате Word (.docx).
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 // Эти структуры описывают runtime-конфигурацию. Они не содержат паролей и
@@ -302,7 +305,7 @@ async fn run_main() -> Result<()> {
         Some(Command::Report(args)) => {
             set_working_directory(None)?;
             let config = load_config(&args.config)?;
-            report_requests(&config, args.period, &args.date).await
+            report_requests(&config, args.period, &args.date, args.output.as_deref()).await
         }
         Some(Command::Gui(args)) => {
             set_working_directory(args.data_dir.as_deref())?;
@@ -400,6 +403,7 @@ struct GuiSettings {
     sip_audio_file: String,
     report_date: String,
     report_period: String,
+    report_output_path: String,
     pfsense_enabled: bool,
     pfsense_url: String,
     pfsense_timeout_seconds: String,
@@ -449,6 +453,7 @@ impl Default for GuiSettings {
             sip_audio_file: String::new(),
             report_date: "2026-09-01".to_owned(),
             report_period: "day".to_owned(),
+            report_output_path: String::new(),
             pfsense_enabled: false,
             pfsense_url: "https://10.35.0.1".to_owned(),
             pfsense_timeout_seconds: "60".to_owned(),
@@ -976,7 +981,7 @@ impl GuiApp {
         });
     }
 
-    fn start_report(&mut self) {
+    fn start_report(&mut self, output_docx: bool) {
         let date = self.settings.report_date.trim().to_owned();
         let period = self.settings.report_period.trim().to_owned();
         if let Err(error) = validate_report_date(&date) {
@@ -987,23 +992,45 @@ impl GuiApp {
             self.status = "Отчет не сформирован: период должен быть day или week".to_owned();
             return;
         }
+        let output_path = if output_docx {
+            let custom = self.settings.report_output_path.trim();
+            let name = if custom.is_empty() {
+                format!("oz-report-{date}-{period}.docx")
+            } else if custom.to_ascii_lowercase().ends_with(".docx") {
+                custom.to_owned()
+            } else {
+                format!("{custom}.docx")
+            };
+            Some(name)
+        } else {
+            None
+        };
         let settings = self.settings.clone();
         let password = self.mssql_password.clone();
         let tx = self.result_tx.clone();
-        self.status = "Формирование отчета...".to_owned();
+        self.status = if output_docx {
+            "Формирование отчёта Word...".to_owned()
+        } else {
+            "Формирование отчета...".to_owned()
+        };
         thread::spawn(move || {
             let mut command = std::process::Command::new(
                 std::env::current_exe().unwrap_or_else(|_| PathBuf::from("oz.exe")),
             );
-            command.args([
-                "report",
-                "--period",
-                &period,
-                "--date",
-                &date,
-                "--config",
-                &settings.config_path,
-            ]);
+            let mut args = vec![
+                "report".to_owned(),
+                "--period".to_owned(),
+                period.clone(),
+                "--date".to_owned(),
+                date.clone(),
+                "--config".to_owned(),
+                settings.config_path.clone(),
+            ];
+            if let Some(path) = &output_path {
+                args.push("--output".to_owned());
+                args.push(path.clone());
+            }
+            command.args(&args);
             command.env(
                 "MSSQL_CONNECTION_STRING",
                 build_connection_string(&settings, &password),
@@ -1011,7 +1038,21 @@ impl GuiApp {
             let message = match command.output() {
                 Ok(output) if output.status.success() => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    format_quick_report(&stdout).unwrap_or_else(|| stdout.into_owned())
+                    if let Some(path) = output_path {
+                        let file_line = stdout
+                            .lines()
+                            .find(|line| line.starts_with("OZ_REPORT_FILE "))
+                            .and_then(|line| line.strip_prefix("OZ_REPORT_FILE "))
+                            .map(str::trim)
+                            .unwrap_or(path.as_str())
+                            .to_owned();
+                        format!(
+                            "Отчёт Word сохранён: {file_line}\n\n{}",
+                            format_quick_report(&stdout).unwrap_or_else(|| stdout.into_owned())
+                        )
+                    } else {
+                        format_quick_report(&stdout).unwrap_or_else(|| stdout.into_owned())
+                    }
                 }
                 Ok(output) => format!(
                     "Ошибка отчета ({}):\n{}{}",
@@ -1904,7 +1945,7 @@ impl eframe::App for GuiApp {
                             );
                         });
                     if ui.button("Сформировать отчет").clicked() {
-                        self.start_report();
+                        self.start_report(false);
                         ui.close_menu();
                     }
                 });
@@ -2012,8 +2053,15 @@ impl eframe::App for GuiApp {
                             );
                         });
                     if ui.button("Сформировать").clicked() {
-                        self.start_report();
+                        self.start_report(false);
                     }
+                    if ui.button("В Word (.docx)").clicked() {
+                        self.start_report(true);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    text_field(ui, "Файл Word (необязательно)", &mut self.settings.report_output_path);
+                    ui.small("Пусто — oz-report-<дата>-<период>.docx в папке программы. Отчёт включает выполненные и необработанные заявки.");
                 });
             });
         });
@@ -2583,8 +2631,240 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
+struct ReportRow {
+    number: String,
+    flow: String,
+    requester: String,
+    status: &'static str,
+    details: String,
+}
+
+fn docx_paragraph(text: &str, bold: bool) -> String {
+    let safe = xml_escape(text).replace('\n', "</w:t><w:br/><w:t xml:space=\"preserve\">");
+    let ppr = if bold {
+        "<w:pPr><w:rPr><w:b/></w:rPr></w:pPr>"
+    } else {
+        ""
+    };
+    format!("<w:p>{ppr}<w:r><w:t xml:space=\"preserve\">{safe}</w:t></w:r></w:p>")
+}
+
+fn docx_table(rows: &[Vec<String>], header: bool) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let cols = rows[0].len().max(1);
+    let width = 9000u32;
+    let col_w = width / cols as u32;
+    let grid = (0..cols)
+        .map(|_| format!("<w:gridCol w:w=\"{col_w}\"/>"))
+        .collect::<String>();
+    let mut body = String::new();
+    for (ridx, row) in rows.iter().enumerate() {
+        body.push_str("<w:tr>");
+        for cell in row {
+            let bold = header && ridx == 0;
+            let safe = xml_escape(cell).replace('\n', "</w:t><w:br/><w:t xml:space=\"preserve\">");
+            let rpr = if bold { "<w:rPr><w:b/></w:rPr>" } else { "" };
+            body.push_str(&format!(
+                "<w:tc><w:tcPr><w:tcW w:w=\"{col_w}\" w:type=\"dxa\"/></w:tcPr><w:p><w:r>{rpr}<w:t xml:space=\"preserve\">{safe}</w:t></w:r></w:p></w:tc>"
+            ));
+        }
+        body.push_str("</w:tr>");
+    }
+    format!(
+        "<w:tbl><w:tblPr><w:tblW w:w=\"{width}\" w:type=\"dxa\"/><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/><w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/></w:tblBorders></w:tblPr><w:tblGrid>{grid}</w:tblGrid>{body}</w:tbl>"
+    )
+}
+
+fn crc32fast(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = if crc & 1 != 0 { 0xEDB8_8320 } else { 0 };
+            crc = (crc >> 1) ^ mask;
+        }
+    }
+    !crc
+}
+
+fn write_zip_stored(path: &std::path::Path, files: &[(&str, &[u8])]) -> Result<()> {
+    use std::io::{Seek, Write};
+    let mut out =
+        fs::File::create(path).with_context(|| format!("создание файла {}", path.display()))?;
+    let mut local_offsets = Vec::with_capacity(files.len());
+    for (name, data) in files {
+        let offset = out.stream_position().context("позиция в zip")? as u32;
+        local_offsets.push(offset);
+        let name_bytes = name.as_bytes();
+        let crc = crc32fast(data);
+        out.write_all(&0x04034b50u32.to_le_bytes())?;
+        out.write_all(&20u16.to_le_bytes())?;
+        out.write_all(&0u16.to_le_bytes())?;
+        out.write_all(&0u16.to_le_bytes())?;
+        out.write_all(&0u16.to_le_bytes())?;
+        out.write_all(&0u16.to_le_bytes())?;
+        out.write_all(&crc.to_le_bytes())?;
+        out.write_all(&(data.len() as u32).to_le_bytes())?;
+        out.write_all(&(data.len() as u32).to_le_bytes())?;
+        out.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
+        out.write_all(&0u16.to_le_bytes())?;
+        out.write_all(name_bytes)?;
+        out.write_all(data)?;
+    }
+    let central_offset = out.stream_position().context("позиция каталога zip")? as u32;
+    let mut central: Vec<u8> = Vec::new();
+    for ((name, data), offset) in files.iter().zip(local_offsets.iter()) {
+        let name_bytes = name.as_bytes();
+        let crc = crc32fast(data);
+        central.extend_from_slice(&0x02014b50u32.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name_bytes);
+    }
+    out.write_all(&central)?;
+    let central_size = central.len() as u32;
+    out.write_all(&0x06054b50u32.to_le_bytes())?;
+    out.write_all(&0u16.to_le_bytes())?;
+    out.write_all(&0u16.to_le_bytes())?;
+    out.write_all(&(files.len() as u16).to_le_bytes())?;
+    out.write_all(&(files.len() as u16).to_le_bytes())?;
+    out.write_all(&central_size.to_le_bytes())?;
+    out.write_all(&central_offset.to_le_bytes())?;
+    out.write_all(&0u16.to_le_bytes())?;
+    Ok(())
+}
+
+fn report_period_title(period: ReportPeriod, date: &str) -> String {
+    match period {
+        ReportPeriod::Day => format!("Отчёт по заявкам за день {date}"),
+        ReportPeriod::Week => format!("Отчёт по заявкам за неделю (по {date}, 7 дней)"),
+    }
+}
+
+fn write_word_report(
+    path: &std::path::Path,
+    period: ReportPeriod,
+    date: &str,
+    rows: &[ReportRow],
+) -> Result<()> {
+    let title = report_period_title(period, date);
+    let total = rows.len();
+    let processed = rows.iter().filter(|r| r.status == "processed").count();
+    let unprocessed = total.saturating_sub(processed);
+    let mut body = String::new();
+    body.push_str(&docx_paragraph(&title, true));
+    body.push_str(&docx_paragraph(&format!("Дата отчёта: {date}"), false));
+    body.push_str(&docx_paragraph(
+        &format!("Всего: {total}; выполнено: {processed}; необработано: {unprocessed}"),
+        false,
+    ));
+    body.push_str(&docx_paragraph("", false));
+    let header = vec![
+        "№".to_owned(),
+        "Поток".to_owned(),
+        "Автор".to_owned(),
+        "Статус".to_owned(),
+        "Детали".to_owned(),
+    ];
+    body.push_str(&docx_paragraph("Выполненные заявки", true));
+    let mut done_rows = vec![header.clone()];
+    for row in rows.iter().filter(|r| r.status == "processed") {
+        done_rows.push(vec![
+            row.number.clone(),
+            row.flow.clone(),
+            if row.requester.trim().is_empty() {
+                "автор не указан".to_owned()
+            } else {
+                row.requester.clone()
+            },
+            source_status_label(row.status).to_owned(),
+            row.details.clone(),
+        ]);
+    }
+    if done_rows.len() == 1 {
+        body.push_str(&docx_paragraph("Нет выполненных заявок.", false));
+    } else {
+        body.push_str(&docx_table(&done_rows, true));
+    }
+    body.push_str(&docx_paragraph("", false));
+    body.push_str(&docx_paragraph("Необработанные заявки", true));
+    let mut pending_rows = vec![header];
+    for row in rows.iter().filter(|r| r.status != "processed") {
+        pending_rows.push(vec![
+            row.number.clone(),
+            row.flow.clone(),
+            if row.requester.trim().is_empty() {
+                "автор не указан".to_owned()
+            } else {
+                row.requester.clone()
+            },
+            source_status_label(row.status).to_owned(),
+            row.details.clone(),
+        ]);
+    }
+    if pending_rows.len() == 1 {
+        body.push_str(&docx_paragraph("Нет необработанных заявок.", false));
+    } else {
+        body.push_str(&docx_table(&pending_rows, true));
+    }
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    {body}
+    <w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr>
+  </w:body>
+</w:document>"#
+    );
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>"#;
+    write_zip_stored(
+        path,
+        &[
+            ("[Content_Types].xml", content_types.as_bytes()),
+            ("_rels/.rels", rels.as_bytes()),
+            ("word/document.xml", document_xml.as_bytes()),
+            ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
+        ],
+    )
+    .with_context(|| format!("сохранение отчёта Word {}", path.display()))?;
+    Ok(())
+}
+
 // Отчет выводит номер, поток, автора и статус без содержимого документов.
-async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -> Result<()> {
+async fn report_requests(
+    config: &AppConfig,
+    period: ReportPeriod,
+    date: &str,
+    output: Option<&std::path::Path>,
+) -> Result<()> {
     validate_report_date(date)?;
     let requests_config = config
         .requests
@@ -2616,13 +2896,13 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
             "rejected" => rejected += 1,
             _ => waiting += 1,
         }
-        rows.push((
-            request.request_num.clone(),
-            request.flow_name.clone(),
-            request.requester.clone(),
+        rows.push(ReportRow {
+            number: request.request_num.clone(),
+            flow: request.flow_name.clone(),
+            requester: request.requester.clone(),
             status,
-            request.status_details(),
-        ));
+            details: request.status_details(),
+        });
     }
     println!(
         "OZ_REPORT period={} anchor_date={} total={} processed={} waiting={} rejected={}",
@@ -2636,11 +2916,15 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
         waiting,
         rejected
     );
-    for (number, flow, requester, status, details) in rows {
+    for row in &rows {
         println!(
-            "OZ_REQUEST num={} flow={} requester={} details={} status={status}",
-            number, flow, requester, details
+            "OZ_REQUEST num={} flow={} requester={} details={} status={}",
+            row.number, row.flow, row.requester, row.details, row.status
         );
+    }
+    if let Some(path) = output {
+        write_word_report(path, period, date, &rows)?;
+        println!("OZ_REPORT_FILE {}", path.display());
     }
 
     Ok(())

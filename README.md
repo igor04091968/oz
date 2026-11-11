@@ -287,6 +287,16 @@ cargo run -- report --period day --date 2026-09-01 --config config.toml
 cargo run -- report --period week --date 2026-09-01 --config config.toml
 ```
 
+Отчёт в Word (.docx) с разделами «Выполненные заявки» и «Необработанные заявки» (за день или неделю):
+
+```sh
+cargo run -- report --period day --date 2026-09-01 --config config.toml --output report-day.docx
+cargo run -- report --period week --date 2026-09-01 --config config.toml --output report-week.docx
+```
+
+В GUI (меню «Быстрый отчет») доступны «Сформировать» и «В Word (.docx)»; при пустом пути файл сохраняется в папке программы как `oz-report-<дата>-<период>.docx`.
+
+
 Отчет выводит строки `OZ_REQUEST` с номером, потоком, автором,
 детализацией поручений `details` и итоговым `status`.
 Для всех четырёх потоков действуют одинаковые правила:
