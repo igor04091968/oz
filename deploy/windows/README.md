@@ -25,8 +25,9 @@ Restart the service process after changing environment variables.
 ## Local voice requirement
 
 For call announcements, OZ waits for handset pickup/bridge RTP and then plays
-the fixed phrase `проверить обработку заявки`. If `sip_audio_file` is empty or
-`auto`, OZ generates this announcement locally through the Windows Speech API.
+the pending-requests announcement (same text as the XMPP notification: count and
+request numbers). If `sip_audio_file` is empty or `auto`, OZ generates this
+announcement locally through the Windows Speech API (e.g. Microsoft Irina).
 The workstation must have a local Russian Windows voice package installed, for
 example `Microsoft Irina Desktop`:
 

@@ -698,6 +698,7 @@ impl GuiApp {
         self.sip_running = true;
         self.sip_ready = false;
         let tx = self.result_tx.clone();
+        let announcement_text = Arc::clone(&self.announcement_text);
         thread::spawn(move || {
             let config = PhoneBuilder::new()
                 .credentials(&username, &password, &server)
@@ -714,7 +715,14 @@ impl GuiApp {
                 // Callback регистрируется до автоответа: xphone вызовет его
                 // после согласования SDP и готовности RTP-медиаканала.
                 if audio_enabled {
-                    let announcement = SIP_CALL_ANNOUNCEMENT_TEXT.to_owned();
+                    let announcement = if audio_file.is_empty() || audio_file == "auto" {
+                        announcement_text
+                            .lock()
+                            .map(|value| value.clone())
+                            .unwrap_or_else(|_| SIP_CALL_ANNOUNCEMENT_TEXT.to_owned())
+                    } else {
+                        String::new()
+                    };
                     let audio_result = if audio_file.is_empty() || audio_file == "auto" {
                         synthesize_speech_wav(&announcement).and_then(|path| {
                             let result = load_pcm_wav(&path);
@@ -730,7 +738,7 @@ impl GuiApp {
                             let prepared = format!(
                                 "SIP_AUDIO_PREPARED samples={} frames={frame_count} announcement={}",
                                 samples.len(),
-                                SIP_CALL_ANNOUNCEMENT_TEXT
+                                announcement
                             );
                             write_sip_diagnostic(&prepared);
                             let _ = incoming_tx.send(prepared);
@@ -821,7 +829,6 @@ impl GuiApp {
                                         info!(
                                             file = %file_name,
                                             frames = sent_frames,
-                                            announcement = SIP_CALL_ANNOUNCEMENT_TEXT,
                                             "SIP voice message playback completed"
                                         );
                                         let sent = format!("SIP_RTP_FRAMES_SENT count={sent_frames}");
@@ -1789,7 +1796,7 @@ impl eframe::App for GuiApp {
                         "Проигрывать голосовое сообщение",
                     );
                     text_field(ui, "Файл сообщения WAV", &mut self.settings.sip_audio_file);
-                    ui.small("Пусто или auto: синтез фразы «проверить обработку заявки» после поднятия трубки. Можно указать свой PCM WAV 16-bit mono 8/16 kHz.");
+                    ui.small("Пусто или auto: синтез текста оповещения о необработанных заявках (как в XMPP, через Windows Speech API/Irina) после поднятия трубки. Можно указать свой PCM WAV 16-bit mono 8/16 kHz.");
                 });
                 ui.menu_button("pfSense", |ui| {
                     ui.set_min_width(440.0);
