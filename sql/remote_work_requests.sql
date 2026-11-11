@@ -54,7 +54,7 @@ outer apply (
             where por.id_filial = d.id_filial
               and por.id_docum = d.id
               and por.del = 0
-            order by por.num, por.id
+            order by por.id
             for xml path(''), type
         ).value('.', 'nvarchar(max)'), 1, 1, N''), N'') as assignment_actors
 ) actors
