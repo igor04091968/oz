@@ -13,7 +13,14 @@ poll_lookback_days = 30
 # Name fragments, OR within the list; empty means any recipient.
 included_recipients = []
 excluded_authors = []
-# Uncomment to limit all four flows to one docum.id_filial; omit for all branches.
+# One flow name per item (potok.name). Add custom flows if needed.
+tracked_flows = [
+  "Заявки на удаленную работу",
+  "Служебные записки",
+  "Запросы на права",
+  "Согласие на работу в выходные дни",
+]
+# Uncomment to limit selected flows to one docum.id_filial; omit for all branches.
 # branch_id = 1
 
 [pfsense]

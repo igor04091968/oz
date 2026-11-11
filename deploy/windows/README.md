@@ -24,9 +24,11 @@ Restart the service process after changing environment variables.
 
 ## Local voice requirement
 
-If the GUI setting `sip_audio_file` is empty, OZ generates the announcement
-locally through the Windows Speech API. The workstation must have a local
-Russian Windows voice package installed, for example `Microsoft Irina Desktop`:
+For call announcements, OZ waits for handset pickup/bridge RTP and then plays
+the fixed phrase `проверить обработку заявки`. If `sip_audio_file` is empty or
+`auto`, OZ generates this announcement locally through the Windows Speech API.
+The workstation must have a local Russian Windows voice package installed, for
+example `Microsoft Irina Desktop`:
 
 `Settings -> Time & language -> Speech -> Voices`
 

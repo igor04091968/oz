@@ -18,7 +18,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -120,10 +120,16 @@ struct RequestsConfig {
     included_recipients: Vec<String>,
     #[serde(default)]
     branch_id: Option<i32>,
+    #[serde(default = "default_tracked_flows")]
+    tracked_flows: Vec<String>,
 }
 
 fn default_poll_lookback_days() -> u32 {
     30
+}
+
+fn default_tracked_flows() -> Vec<String> {
+    TRACKED_FLOW_NAMES.iter().map(|name| (*name).to_owned()).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +143,12 @@ struct RemoteWorkRequest {
 }
 
 const REMOTE_WORK_FLOW: &str = "Заявки на удаленную работу";
+const TRACKED_FLOW_NAMES: [&str; 4] = [
+    "Заявки на удаленную работу",
+    "Служебные записки",
+    "Запросы на права",
+    "Согласие на работу в выходные дни",
+];
 
 const ASSIGNMENT_STATUSES: [&str; 8] = [
     "Получено",
@@ -223,7 +235,10 @@ impl RemoteWorkRequest {
 }
 
 const PFSENSE_CACHE_TTL_SECONDS: u64 = 3600;
-const SIP_ANNOUNCEMENT_DELAY_SECONDS: u64 = 5;
+const SIP_CALL_ANNOUNCEMENT_TEXT: &str = "проверить обработку заявки";
+const SIP_PICKUP_WAIT_TIMEOUT_SECONDS: u64 = 90;
+const SIP_PICKUP_RTP_PACKETS_REQUIRED: usize = 8;
+const SIP_POST_PICKUP_DELAY_MILLIS: u64 = 700;
 
 fn write_sip_diagnostic(message: &str) {
     let path = std::env::temp_dir().join("oz-sip-media.log");
@@ -269,16 +284,24 @@ async fn run_main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => run_gui(GuiArgs::default()),
+        None => {
+            set_working_directory(None)?;
+            run_gui(GuiArgs::default())
+        }
         Some(Command::ProcessRequests(args)) => {
+            set_working_directory(None)?;
             let config = load_config(&args.config)?;
             process_requests(&config).await
         }
         Some(Command::Report(args)) => {
+            set_working_directory(None)?;
             let config = load_config(&args.config)?;
             report_requests(&config, args.period, &args.date).await
         }
-        Some(Command::Gui(args)) => run_gui(args),
+        Some(Command::Gui(args)) => {
+            set_working_directory(args.data_dir.as_deref())?;
+            run_gui(GuiArgs { data_dir: None, ..args })
+        }
     }
 }
 
@@ -342,6 +365,7 @@ struct GuiSettings {
     excluded_authors: String,
     included_recipients: String,
     branch_id: String,
+    tracked_flows: String,
     poll_enabled: bool,
     sql_server: String,
     sql_port: String,
@@ -386,6 +410,8 @@ impl Default for GuiSettings {
             excluded_authors: String::new(),
             included_recipients: String::new(),
             branch_id: String::new(),
+            tracked_flows: TRACKED_FLOW_NAMES.join("
+"),
             poll_enabled: true,
             sql_server: "srv-db".to_owned(),
             sql_port: "1433".to_owned(),
@@ -639,7 +665,6 @@ impl GuiApp {
         let password = self.sip_password.clone();
         let audio_enabled = self.settings.sip_audio_enabled;
         let audio_file = self.settings.sip_audio_file.trim().to_owned();
-        let announcement_text = Arc::clone(&self.announcement_text);
         if server.is_empty() || username.is_empty() || password.is_empty() {
             self.status = "SIP не запущен: заполните сервер, номер и Secret".to_owned();
             return;
@@ -665,12 +690,7 @@ impl GuiApp {
                 // Callback регистрируется до автоответа: xphone вызовет его
                 // после согласования SDP и готовности RTP-медиаканала.
                 if audio_enabled {
-                    let announcement = announcement_text
-                        .lock()
-                        .map(|value| value.clone())
-                        .unwrap_or_else(|_| {
-                            "Количество заявок на удаленное подключение: 0.".to_owned()
-                        });
+                    let announcement = SIP_CALL_ANNOUNCEMENT_TEXT.to_owned();
                     let audio_result = if audio_file.is_empty() || audio_file == "auto" {
                         synthesize_speech_wav(&announcement).and_then(|path| {
                             let result = load_pcm_wav(&path);
@@ -684,8 +704,9 @@ impl GuiApp {
                         Ok(samples) => {
                             let frame_count = samples.len().div_ceil(160);
                             let prepared = format!(
-                                "SIP_AUDIO_PREPARED samples={} frames={frame_count}",
-                                samples.len()
+                                "SIP_AUDIO_PREPARED samples={} frames={frame_count} announcement={}",
+                                samples.len(),
+                                SIP_CALL_ANNOUNCEMENT_TEXT
                             );
                             write_sip_diagnostic(&prepared);
                             let _ = incoming_tx.send(prepared);
@@ -701,16 +722,56 @@ impl GuiApp {
                                 write_sip_diagnostic("SIP_MEDIA_CALLBACK_FIRED");
                                 let _ = media_tx.send("SIP_MEDIA_CALLBACK_FIRED".to_owned());
                                 thread::spawn(move || {
-                                    // АТС сначала отвечает на виртуальный номер 1000,
-                                    // затем дозванивается до целевого абонента и только
-                                    // после этого создает bridge. Немедленная передача
-                                    // RTP попадает в первый leg и до абонента не доходит.
-                                    thread::sleep(Duration::from_secs(
-                                        SIP_ANNOUNCEMENT_DELAY_SECONDS,
-                                    ));
-                                    if let Some(call) = weak_call.upgrade()
-                                        && let Some(writer) = call.pcm_writer()
-                                    {
+                                    let Some(call) = weak_call.upgrade() else {
+                                        write_sip_diagnostic("SIP_CALL_GONE_BEFORE_PLAYBACK");
+                                        let _ = media_tx.send("SIP_CALL_GONE_BEFORE_PLAYBACK".to_owned());
+                                        return;
+                                    };
+                                    // Дожидаемся поднятия трубки: после ответа 1000 АТС
+                                    // дозванивается до цели, и только после bridge/pickup
+                                    // к виртуальному аппарату приходит устойчивый RTP от абонента.
+                                    let rtp_rx = call.rtp_reader();
+                                    let pickup_deadline = Instant::now()
+                                        + Duration::from_secs(SIP_PICKUP_WAIT_TIMEOUT_SECONDS);
+                                    let mut received_packets = 0usize;
+                                    let picked_up = loop {
+                                        if Instant::now() >= pickup_deadline {
+                                            break false;
+                                        }
+                                        if let Some(rx) = rtp_rx.as_ref() {
+                                            match rx.recv_timeout(Duration::from_millis(200)) {
+                                                Ok(_) => {
+                                                    received_packets += 1;
+                                                    if received_packets >= SIP_PICKUP_RTP_PACKETS_REQUIRED {
+                                                        break true;
+                                                    }
+                                                }
+                                                Err(_) => {}
+                                            }
+                                        } else {
+                                            thread::sleep(Duration::from_millis(200));
+                                        }
+                                    };
+                                    if !picked_up {
+                                        let msg = format!(
+                                            "SIP_PICKUP_TIMEOUT packets={received_packets} timeout_s={}",
+                                            SIP_PICKUP_WAIT_TIMEOUT_SECONDS
+                                        );
+                                        write_sip_diagnostic(&msg);
+                                        let _ = media_tx.send(msg);
+                                        warn!(
+                                            file = %file_name,
+                                            packets = received_packets,
+                                            timeout_seconds = SIP_PICKUP_WAIT_TIMEOUT_SECONDS,
+                                            "SIP announcement skipped: handset pickup/bridge not detected"
+                                        );
+                                        return;
+                                    }
+                                    let picked = format!("SIP_PICKUP_DETECTED packets={received_packets}");
+                                    write_sip_diagnostic(&picked);
+                                    let _ = media_tx.send(picked);
+                                    thread::sleep(Duration::from_millis(SIP_POST_PICKUP_DELAY_MILLIS));
+                                    if let Some(writer) = call.pcm_writer() {
                                         let transport = format!(
                                             "SIP_PCM_WRITER_ACQUIRED remote={}:{} active={}",
                                             call.remote_ip(),
@@ -739,12 +800,10 @@ impl GuiApp {
                                         info!(
                                             file = %file_name,
                                             frames = sent_frames,
-                                            delay_seconds = SIP_ANNOUNCEMENT_DELAY_SECONDS,
-                                            "SIP voice message playback started"
+                                            announcement = SIP_CALL_ANNOUNCEMENT_TEXT,
+                                            "SIP voice message playback completed"
                                         );
-                                        let sent = format!(
-                                            "SIP_RTP_FRAMES_SENT count={sent_frames}"
-                                        );
+                                        let sent = format!("SIP_RTP_FRAMES_SENT count={sent_frames}");
                                         write_sip_diagnostic(&sent);
                                         let _ = media_tx.send(sent);
                                     } else {
@@ -1646,6 +1705,7 @@ impl eframe::App for GuiApp {
                         "Проигрывать голосовое сообщение",
                     );
                     text_field(ui, "Файл сообщения WAV", &mut self.settings.sip_audio_file);
+                    ui.small("Пусто или auto: синтез фразы «проверить обработку заявки» после поднятия трубки. Можно указать свой PCM WAV 16-bit mono 8/16 kHz.");
                 });
                 ui.menu_button("pfSense", |ui| {
                     ui.set_min_width(440.0);
@@ -1717,6 +1777,31 @@ impl eframe::App for GuiApp {
                         "Глубина выборки, дней",
                         &mut self.settings.poll_lookback_days,
                     );
+                    ui.label("Отслеживаемые потоки");
+                    let mut selected_flows = parse_tracked_flows(&self.settings.tracked_flows);
+                    for flow in TRACKED_FLOW_NAMES {
+                        let mut checked = selected_flows.iter().any(|name| name == flow);
+                        if ui.checkbox(&mut checked, flow).changed() {
+                            if checked {
+                                if !selected_flows.iter().any(|name| name == flow) {
+                                    selected_flows.push(flow.to_owned());
+                                }
+                            } else {
+                                selected_flows.retain(|name| name != flow);
+                            }
+                            selected_flows = normalize_flow_selection(&selected_flows);
+                            self.settings.tracked_flows = selected_flows.join("\n");
+                            selected_flows = parse_tracked_flows(&self.settings.tracked_flows);
+                        }
+                    }
+                    ui.label("Потоки вручную (по одному на строку, можно добавить свой)");
+                    ui.add(
+                        eframe::egui::TextEdit::multiline(&mut self.settings.tracked_flows)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(4)
+                            .hint_text("Например: Служебные записки\nМой поток"),
+                    );
+                    ui.small("Галочки управляют стандартными потоками; здесь можно указать дополнительные имена потоков из MSSQL (точно как в potok.name). Пустой список = все четыре стандартных потока. После сохранения перезапустите опрос.");
                     ui.label("Только заявки, направленные сотрудникам");
                     ui.add(
                         eframe::egui::TextEdit::multiline(&mut self.settings.included_recipients)
@@ -2097,6 +2182,14 @@ fn password_field(ui: &mut eframe::egui::Ui, label: &str, value: &mut String) {
     });
 }
 
+fn application_dir() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("определение директории программы")?;
+    executable
+        .parent()
+        .map(PathBuf::from)
+        .context("определение директории программы")
+}
+
 fn gui_settings_path() -> PathBuf {
     PathBuf::from("gui-settings.toml")
 }
@@ -2217,6 +2310,7 @@ mark_unapproved_as_seen = false
 poll_lookback_days = {}
 excluded_authors = {:?}
 included_recipients = {:?}
+tracked_flows = {:?}
 {}
 
 [pfsense]
@@ -2241,6 +2335,7 @@ skip_tls_verify = {}
             .max(1),
         parse_author_exclusions(&settings.excluded_authors),
         parse_author_exclusions(&settings.included_recipients),
+        parse_tracked_flows(&settings.tracked_flows),
         branch_config,
         settings.pfsense_url,
         settings
@@ -2256,11 +2351,17 @@ skip_tls_verify = {}
         .with_context(|| format!("write {}", settings.config_path))
 }
 
+fn set_working_directory(data_dir: Option<&std::path::Path>) -> Result<()> {
+    let work_dir = match data_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => application_dir()?,
+    };
+    std::env::set_current_dir(&work_dir)
+        .with_context(|| format!("открытие рабочей папки программы {}", work_dir.display()))
+}
+
 fn run_gui(args: GuiArgs) -> Result<()> {
-    if let Some(dir) = &args.data_dir {
-        std::env::set_current_dir(dir)
-            .with_context(|| format!("открытие папки настроек {}", dir.display()))?;
-    }
+    let _ = args;
     // У Windows включен windows_subsystem = "windows", поэтому запуск GUI не
     // открывает дополнительное консольное окно.
     // Keep eframe's default Preferred acceleration: it uses the normal GPU
@@ -2344,6 +2445,7 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
     let source_query = fs::read_to_string(&requests_config.query_file)
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
     let query = query_for_poll_lookback(&source_query, requests_config.poll_lookback_days)?;
+    let query = apply_flow_filter_to_query(&query, &requests_config.tracked_flows)?;
     let query = apply_branch_filter_to_query(&query, requests_config.branch_id)?;
     let query = apply_author_exclusions_to_query(&query, &requests_config.excluded_authors)?;
     let query = apply_recipient_filter_to_query(&query, &requests_config.included_recipients)?;
@@ -2433,6 +2535,7 @@ async fn report_requests(config: &AppConfig, period: ReportPeriod, date: &str) -
     let source_query = fs::read_to_string(&requests_config.query_file)
         .with_context(|| format!("read request query file {}", requests_config.query_file))?;
     let query = query_for_report_period(&source_query, period, date)?;
+    let query = apply_flow_filter_to_query(&query, &requests_config.tracked_flows)?;
     let query = apply_branch_filter_to_query(&query, requests_config.branch_id)?;
     let query = apply_author_exclusions_to_query(&query, &requests_config.excluded_authors)?;
     let query = apply_recipient_filter_to_query(&query, &requests_config.included_recipients)?;
@@ -2576,6 +2679,76 @@ fn is_excluded_author(requester: &str, exclusions: &[String]) -> bool {
             .map(|part| normalize_author_search(part))
             .filter(|part| !part.is_empty())
             .any(|part| author.contains(&part))
+}
+
+fn parse_tracked_flows(value: &str) -> Vec<String> {
+    let mut flows = Vec::new();
+    for entry in value.lines() {
+        let name = entry.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !flows.iter().any(|known: &String| known == name) {
+            flows.push(name.to_owned());
+        }
+    }
+    if flows.is_empty() {
+        default_tracked_flows()
+    } else {
+        flows
+    }
+}
+
+fn normalize_flow_selection(flows: &[String]) -> Vec<String> {
+    let mut unique = Vec::new();
+    for entry in flows {
+        let name = entry.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !unique.iter().any(|known: &String| known == name) {
+            unique.push(name.to_owned());
+        }
+    }
+    if unique.is_empty() {
+        return default_tracked_flows();
+    }
+    let mut selected = Vec::new();
+    for name in TRACKED_FLOW_NAMES {
+        if unique.iter().any(|flow| flow == name) {
+            selected.push(name.to_owned());
+        }
+    }
+    for name in unique {
+        if !TRACKED_FLOW_NAMES.contains(&name.as_str()) {
+            selected.push(name);
+        }
+    }
+    selected
+}
+
+fn apply_flow_filter_to_query(query: &str, flows: &[String]) -> Result<String> {
+    const MARKER: &str = "-- {{FLOW_FILTER}}";
+    let selected = normalize_flow_selection(flows);
+    let occurrences = query.matches(MARKER).count();
+    if occurrences == 0 {
+        let defaults = default_tracked_flows();
+        if selected == defaults {
+            return Ok(query.to_owned());
+        }
+        bail!(
+            "SQL-запрос должен содержать один маркер {MARKER} в WHERE для фильтра потоков. Обновите SQL-файл."
+        );
+    }
+    if occurrences != 1 {
+        bail!("SQL-запрос должен содержать один маркер {MARKER} в WHERE для фильтра потоков");
+    }
+    let values = selected
+        .iter()
+        .map(|name| format!("N'{}'", name.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(query.replace(MARKER, &format!("and rtrim(p.name) in ({values})")))
 }
 
 fn parse_branch_id(value: &str) -> Result<Option<i32>> {
@@ -3503,17 +3676,21 @@ mod tests {
             query_for_report_period(source, ReportPeriod::Day, "2026-10-16").unwrap(),
             query_for_report_period(source, ReportPeriod::Week, "2026-10-16").unwrap(),
         ] {
-            let query = apply_branch_filter_to_query(&dated, Some(7)).unwrap();
+            let query = apply_flow_filter_to_query(&dated, &default_tracked_flows()).unwrap();
+            let query = apply_branch_filter_to_query(&query, Some(7)).unwrap();
             let query = apply_author_exclusions_to_query(&query, &["Иванов".to_owned()]).unwrap();
             assert!(query.contains("and d.id_filial = 7"));
             assert!(query.contains("charindex(N'иванов', isnull(u.name, N'')) > 0"));
             assert!(query.contains("where por.id_filial = d.id_filial"));
             assert!(query.contains("N'Согласие на работу в выходные дни'"));
+            assert!(!query.contains("{{FLOW_FILTER}}"));
             assert!(!query.contains("{{BRANCH_FILTER}}"));
             assert!(!query.contains("{{AUTHOR_EXCLUSION_FILTER}}"));
         }
-        let query = apply_branch_filter_to_query(source, None).unwrap();
+        let query = apply_flow_filter_to_query(source, &default_tracked_flows()).unwrap();
+        let query = apply_branch_filter_to_query(&query, None).unwrap();
         assert!(!query.contains("and d.id_filial ="));
+        assert!(!query.contains("{{FLOW_FILTER}}"));
         assert!(!query.contains("{{BRANCH_FILTER}}"));
     }
 
@@ -3659,7 +3836,8 @@ mod tests {
             query_for_report_period(source, ReportPeriod::Day, "2026-10-20").unwrap(),
             query_for_report_period(source, ReportPeriod::Week, "2026-10-20").unwrap(),
         ] {
-            let query = apply_branch_filter_to_query(&dated, Some(7)).unwrap();
+            let query = apply_flow_filter_to_query(&dated, &default_tracked_flows()).unwrap();
+            let query = apply_branch_filter_to_query(&query, Some(7)).unwrap();
             let query = apply_author_exclusions_to_query(&query, &["Автор".to_owned()]).unwrap();
             let query = apply_recipient_filter_to_query(&query, &["Петров".to_owned()]).unwrap();
             assert!(query.contains("and d.id_filial = 7"));
@@ -3670,9 +3848,10 @@ mod tests {
             assert!(query.contains("and por.del = 0"));
             assert!(!query.contains("{{"));
         }
-        let empty = apply_recipient_filter_to_query(source, &[]).unwrap();
+        let with_flows = apply_flow_filter_to_query(source, &default_tracked_flows()).unwrap();
+        let empty = apply_recipient_filter_to_query(&with_flows, &[]).unwrap();
         assert!(!empty.contains("from poruch recipient_assignment"));
-        assert!(!empty.contains("{{RECIPIENT_INCLUSION_FILTER}}"));
+        assert!(!empty.contains("{{"));
     }
 
     #[test]

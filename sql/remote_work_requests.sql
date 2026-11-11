@@ -44,12 +44,7 @@ outer apply (
 ) statuses
 where d.date1 >= @d1
   and d.date1 < dateadd(day, 1, @d2)
-  and rtrim(p.name) in (
-      N'Заявки на удаленную работу',
-      N'Служебные записки',
-      N'Запросы на права',
-      N'Согласие на работу в выходные дни'
-  )
+  -- {{FLOW_FILTER}}
 -- {{BRANCH_FILTER}}
 -- {{AUTHOR_EXCLUSION_FILTER}}
 -- {{RECIPIENT_INCLUSION_FILTER}}

@@ -1,6 +1,6 @@
 [package]
 name = "oz"
-version = "0.1.48"
+version = "0.1.52"
 edition = "2024"
 
 [dependencies]
