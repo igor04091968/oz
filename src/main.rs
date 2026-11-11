@@ -1893,7 +1893,7 @@ impl eframe::App for GuiApp {
                             .desired_rows(3)
                             .hint_text("Фамилия или часть ФИО, по одному на строку"),
                     );
-                    ui.small("Хотя бы один получатель должен совпасть со списком. Пусто — все получатели.");
+                    ui.small("Хотя бы один получатель должен совпасть со списком. Если у всех указанных получателей по заявке поручения уже обработаны (исполнено/согласовано/отказано/принято к сведению/ознакомлен), заявка считается выполненной для опросов, оповещений и отчётов. Пусто — все получатели.");
                     ui.label("Исключать авторов (часть имени или фамилии, по одному на строку)");
                     ui.add(
                         eframe::egui::TextEdit::multiline(&mut self.settings.excluded_authors)
@@ -2567,8 +2567,11 @@ async fn process_requests(config: &AppConfig) -> Result<()> {
         excluded, "fetched tracked documents after author exclusions"
     );
     // Только текущее состояние MSSQL определяет очередь, старый аудит её не скрывает.
-    let (notify_requests, gated_requests) =
-        split_pending_requests(&requests, &requests_config.preapproval_employees);
+    let (notify_requests, gated_requests) = split_pending_requests(
+        &requests,
+        &requests_config.preapproval_employees,
+        &requests_config.included_recipients,
+    );
     // Отпечаток набора используется GUI для подавления повторных уведомлений.
     let mut pending_keys = notify_requests
         .iter()
@@ -2890,7 +2893,7 @@ async fn report_requests(
     let mut rejected = 0usize;
     let mut rows = Vec::with_capacity(requests.len());
     for request in requests {
-        let status = request.source_status();
+        let status = effective_report_status(&request, &requests_config.included_recipients);
         match status {
             "processed" => processed += 1,
             "rejected" => rejected += 1,
@@ -3126,13 +3129,73 @@ fn request_preapproved_by_employees(request: &RemoteWorkRequest, preapprovers: &
     })
 }
 
+fn is_handled_assignment_status(status: &str) -> bool {
+    matches!(
+        status.trim(),
+        "Исполнено" | "Согласовано" | "Не согласовано" | "Принято к сведению" | "Ознакомлен"
+    )
+}
+
+// When "Только заявки, направленные сотрудникам" is set, a request is considered
+// completed for this view if every assignment of the listed recipients is already
+// handled (executed/agreed/rejected/noted/read), so it must not trigger reminders
+// or appear as unprocessed in reports.
+fn request_completed_for_included_recipients(
+    request: &RemoteWorkRequest,
+    included_recipients: &[String],
+) -> bool {
+    if included_recipients.is_empty() {
+        return false;
+    }
+    let Some(actors) = &request.assignment_actors else {
+        return false;
+    };
+    let mut matched = false;
+    for (name, status) in actors {
+        let actor = normalize_author_search(name);
+        if actor.is_empty() {
+            continue;
+        }
+        let is_included = included_recipients.iter().any(|required| {
+            let required = normalize_author_search(required);
+            !required.is_empty() && actor.contains(&required)
+        });
+        if !is_included {
+            continue;
+        }
+        matched = true;
+        if !is_handled_assignment_status(status) {
+            return false;
+        }
+    }
+    matched
+}
+
+fn effective_report_status(
+    request: &RemoteWorkRequest,
+    included_recipients: &[String],
+) -> &'static str {
+    let source = request.source_status();
+    if !matches!(source, "processed" | "rejected")
+        && request_completed_for_included_recipients(request, included_recipients)
+    {
+        "processed"
+    } else {
+        source
+    }
+}
+
 fn split_pending_requests<'a>(
     requests: &'a [RemoteWorkRequest],
     preapprovers: &[String],
+    included_recipients: &[String],
 ) -> (Vec<&'a RemoteWorkRequest>, Vec<&'a RemoteWorkRequest>) {
     let base = requests
         .iter()
-        .filter(|request| !matches!(request.source_status(), "processed" | "rejected"))
+        .filter(|request| {
+            !matches!(request.source_status(), "processed" | "rejected")
+                && !request_completed_for_included_recipients(request, included_recipients)
+        })
         .collect::<Vec<_>>();
     if preapprovers.is_empty() {
         return (base, Vec::new());
